@@ -6,6 +6,19 @@ Windows 10/11 的 2.4G 无线外设电量托盘工具。
 
 ![面板](docs/panel.png)
 
+## 下载
+
+两种方式任选：
+
+- **免安装（推荐）**：到 [Releases](https://github.com/Ap0LoG1zE/EZ2.4G/releases) 下载 `外设电量.exe`，双击运行，无需 Python。
+- **最小体积**：下载 `my_devices.py`（约 150 KB），安装 Python 3.10+ 后运行：
+
+```bat
+python my_devices.py
+```
+
+> exe 未签名，Windows 可能提示 SmartScreen，选择“更多信息 → 仍要运行”。
+
 ## 功能
 
 - 托盘常驻，左键刷新，右键打开面板

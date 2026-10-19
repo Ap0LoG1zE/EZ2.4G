@@ -1391,10 +1391,14 @@ def startup_enabled() -> bool:
 
 
 def project_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def script_path() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
     return os.path.abspath(__file__)
 
 
@@ -1460,8 +1464,12 @@ def create_shortcut(lnk_path: str, target: str, args: str = "",
 def install_startup() -> bool:
     path = startup_lnk()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    create_shortcut(path, pythonw_path(), f'"{script_path()}"',
-                    project_dir(), "外设电量托盘", pythonw_path())
+    if getattr(sys, "frozen", False):
+        create_shortcut(path, script_path(), "", project_dir(),
+                        "外设电量托盘", script_path())
+    else:
+        create_shortcut(path, pythonw_path(), f'"{script_path()}"',
+                        project_dir(), "外设电量托盘", pythonw_path())
     return os.path.isfile(path)
 
 
@@ -1517,6 +1525,16 @@ def _create_file_link(link: str, target: str) -> bool:
 def install_desktop_links() -> list[str]:
     created = []
     desk = desktop_dir()
+    if getattr(sys, "frozen", False):
+        lnk = os.path.join(desk, "外设电量.lnk")
+        if not os.path.exists(lnk):
+            try:
+                create_shortcut(lnk, script_path(), "", project_dir(),
+                                "外设电量", script_path())
+                created.append(lnk)
+            except Exception:
+                pass
+        return created
     dlink = os.path.join(desk, "外设电量")
     flink = os.path.join(desk, "my_devices.py")
     if not os.path.exists(dlink):
@@ -1893,6 +1911,14 @@ def install_all():
 
 
 def main(argv):
+    if argv and argv[0] == "--capture-helper":
+        import runpy
+        base = getattr(sys, "_MEIPASS",
+                       os.path.dirname(os.path.abspath(__file__)))
+        helper = os.path.join(base, "capture_helper.py")
+        sys.argv = ["capture_helper.py"] + list(argv[1:])
+        runpy.run_path(helper, run_name="__main__")
+        return 0
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
@@ -2465,13 +2491,18 @@ class HelpWindow:
                 os.remove(os.path.join(outdir, name))
             except Exception:
                 pass
-        helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "capture_helper.py")
         status_file = os.path.join(outdir, "status.json")
         stop_file = os.path.join(outdir, "stop.flag")
-        params = (f'"{helper}" "{cmd}" {self.target_vid:04X} '
-                  f'{self.target_pid:04X} "{outdir}" "{stop_file}" '
-                  f'"{status_file}"')
+        if getattr(sys, "frozen", False):
+            params = (f'--capture-helper "{cmd}" {self.target_vid:04X} '
+                      f'{self.target_pid:04X} "{outdir}" "{stop_file}" '
+                      f'"{status_file}"')
+        else:
+            helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "capture_helper.py")
+            params = (f'"{helper}" "{cmd}" {self.target_vid:04X} '
+                      f'{self.target_pid:04X} "{outdir}" "{stop_file}" '
+                      f'"{status_file}"')
         sei = _SHELLEXECUTEINFOW()
         sei.cbSize = ctypes.sizeof(sei)
         sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
