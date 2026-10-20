@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import ctypes.wintypes as w
 import dataclasses
 import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import queue
@@ -1749,7 +1751,7 @@ def infer_single_ex(level: int, frames: list):
 
 def infer_two(level_a: int, frames_a: list,
               level_b: int, frames_b: list):
-    """两次不同电量：只保留两个电量都出现在同一偏移、同一前缀的字节。"""
+    """两次不同电量：某字节的差值等于两次电量差值，唯一则采用。"""
     level_a = int(level_a)
     level_b = int(level_b)
     if level_a <= 0 or level_b <= 0 or level_a == level_b:
@@ -1758,27 +1760,18 @@ def infer_two(level_a: int, frames_a: list,
     ins_b, outs_b = _split_frames(frames_b)
     if not ins_a or not ins_b:
         return None, "none"
-    offs_a = _match_offsets(ins_a, level_a)
-    offs_b = _match_offsets(ins_b, level_b)
-    common = offs_a & offs_b
-    if not common:
-        return None, "none"
-
-    candidates = {}
-    for off in common:
-        pa = {d[:2] for _i, d in ins_a
-              if len(d) > off and d[off] == level_a}
-        pb = {d[:2] for _i, d in ins_b
-              if len(d) > off and d[off] == level_b}
-        shared = pa & pb
-        if shared:
-            candidates[off] = shared
+    delta = level_b - level_a
+    candidates = []
+    for off in range(1, 64):
+        va = {d[off] for _i, d in ins_a if len(d) > off}
+        vb = {d[off] for _i, d in ins_b if len(d) > off}
+        if any((y - x) == delta for x in va for y in vb):
+            candidates.append(off)
     if not candidates:
         return None, "none"
     if len(candidates) > 1:
         return None, "ambiguous"
-
-    off = next(iter(candidates))
+    off = candidates[0]
     reqs = _requests_at(frames_a, ins_a, outs_a, off, level_a)
     if not reqs:
         reqs = _requests_at(frames_b, ins_b, outs_b, off, level_b)
@@ -2012,14 +2005,219 @@ def install_all():
         print("桌面链接：已存在，未重创建")
 
 
+CREATE_NO_WINDOW = 0x08000000
+
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateFileW.restype = w.HANDLE
+k32.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p,
+                            w.DWORD, w.DWORD, w.HANDLE]
+
+
+def _helper_scan_devices(path):
+    out = []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return out
+    if len(data) < 24:
+        return out
+    off = 24
+    n = len(data)
+    while off + 16 <= n:
+        try:
+            _ts, _tu, incl, _orig = struct.unpack_from("<IIII", data, off)
+        except Exception:
+            break
+        off += 16
+        if incl <= 0 or off + incl > n:
+            break
+        pkt = data[off:off + incl]
+        off += incl
+        if len(pkt) < 31:
+            continue
+        hlen = struct.unpack_from("<H", pkt, 0)[0]
+        if not (27 <= hlen <= 600) or len(pkt) < hlen:
+            continue
+        dlen = struct.unpack_from("<I", pkt, 23)[0]
+        payload = pkt[hlen:hlen + dlen]
+        for i in range(0, len(payload) - 17):
+            if payload[i] == 18 and payload[i + 1] == 1:
+                vid = payload[i + 8] | (payload[i + 9] << 8)
+                pid = payload[i + 10] | (payload[i + 11] << 8)
+                if vid and pid and (vid, pid) not in out:
+                    out.append((vid, pid))
+    return out
+
+
+def _helper_hub_exists(n):
+    h = k32.CreateFileW("\\\\.\\USBPcap%d" % n, 0, 3, None, 3, 0, None)
+    err = ctypes.get_last_error()
+    if h and h != w.HANDLE(-1).value:
+        k32.CloseHandle(h)
+        return True
+    return err == 5
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", w.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", w.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", w.DWORD),
+                ("SchedulingClass", w.DWORD)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation",
+                 _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+_JOB = None
+
+
+def _setup_job():
+    """Job：helper 退出时连带收掉 USBPcapCMD。"""
+    global _JOB
+    try:
+        k32.CreateJobObjectW.restype = w.HANDLE
+        k32.GetCurrentProcess.restype = w.HANDLE
+        k32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                    ctypes.sizeof(info))
+        k32.AssignProcessToJobObject(job, k32.GetCurrentProcess())
+        _JOB = job
+    except Exception:
+        _JOB = None
+
+
+def _helper_main():
+    _setup_job()
+    (cp, vid_s, pid_s, outdir, stop_flag, status_file) = sys.argv[1:7]
+    vid = int(vid_s, 16)
+    pid = int(pid_s, 16)
+
+    def status(state, hub=0, file=""):
+        tmp = status_file + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"state": state, "hub": hub, "file": file}, f)
+            os.replace(tmp, status_file)
+        except Exception:
+            pass
+
+    hubs = [n for n in range(1, 7) if _helper_hub_exists(n)]
+    status("probing")
+    any_bytes = False
+    found = 0
+    if vid:
+        for hub in hubs:
+            probe = os.path.join(outdir, "probe%d.pcap" % hub)
+            try:
+                os.remove(probe)
+            except Exception:
+                pass
+            try:
+                p = subprocess.Popen(
+                    [cp, "-d", "\\\\.\\USBPcap%d" % hub, "-A",
+                     "--inject-descriptors", "-o", probe],
+                    creationflags=CREATE_NO_WINDOW,
+                    stderr=subprocess.DEVNULL)
+            except Exception:
+                continue
+            time.sleep(4.0)
+            try:
+                p.terminate()
+                p.wait(3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            try:
+                if os.path.getsize(probe) > 0:
+                    any_bytes = True
+            except Exception:
+                pass
+            devs = _helper_scan_devices(probe)
+            if (vid, pid) in devs:
+                found = hub
+                break
+        if not found:
+            status("notraffic" if any_bytes else "busy")
+            return
+    else:
+        found = hubs[0] if hubs else 1
+
+    status("capturing", found)
+    final = os.path.join(outdir, "capture.pcap")
+    try:
+        p = subprocess.Popen(
+            [cp, "-d", "\\\\.\\USBPcap%d" % found, "-A",
+             "--inject-descriptors", "-o", final],
+            creationflags=CREATE_NO_WINDOW,
+            stderr=subprocess.DEVNULL)
+    except Exception:
+        status("error")
+        return
+    started = time.time()
+    while not os.path.exists(stop_flag):
+        if p.poll() is not None:
+            break
+        if time.time() - started > 180:
+            break
+        try:
+            if os.path.getsize(final) > 256 * 1024 * 1024:
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    try:
+        p.terminate()
+        p.wait(3)
+    except Exception:
+        try:
+            p.kill()
+            p.wait(2)
+        except Exception:
+            pass
+    status("done", found, final)
+
+
+def _helper_run(args: list):
+    old = sys.argv
+    sys.argv = ["capture_helper.py"] + list(args)
+    try:
+        _helper_main()
+    finally:
+        sys.argv = old
+
+
 def main(argv):
     if argv and argv[0] == "--capture-helper":
-        import runpy
-        base = getattr(sys, "_MEIPASS",
-                       os.path.dirname(os.path.abspath(__file__)))
-        helper = os.path.join(base, "capture_helper.py")
-        sys.argv = ["capture_helper.py"] + list(argv[1:])
-        runpy.run_path(helper, run_name="__main__")
+        _helper_run(argv[1:])
         return 0
     if "--help" in argv or "-h" in argv:
         print(__doc__)
@@ -2342,7 +2540,7 @@ class HelpWindow:
         self._cap_dir = ""
         self._cap_status_file = ""
         self._cap_stop = ""
-        self._cap_status = self._path_status()
+        self._cap_status = "点击「开始抓包」，抓包时请打开厂家软件显示电量"
         self._cap_txt = ""
         self._ambiguous = False
         self._cap_a = None
@@ -2386,15 +2584,14 @@ class HelpWindow:
             ("b", "接收器在，但厂商协议未收录；软件只做只读试探。"),
             ("h", "你可以这样做"),
             ("b", "1. 安装 USBPcap（装完重启电脑）。"),
-            ("b", "2. 点下方的「选择路径…」按钮，选择刚安装的 USBPcapCMD.exe。"),
-            ("b", "3. 抓包前确认厂家驱动已关闭，点「开始抓包」并允许管理员权限。"),
-            ("b", "4. 然后打开一次厂家驱动，看电量并记下，几秒后点「停止」。"),
-            ("b", "5. 停止后填入刚才看到的电量，软件自动匹配回复帧。"),
-            ("b", "6. 识别成功会保存协议；以后插上就能直接显示电量。"),
-            ("b", "7. 提示“匹配不准确”时，换相差 10% 以上的电量再抓一次。"),
+            ("b", "2. 关闭厂家驱动，点「开始抓包」并允许管理员权限。"),
+            ("b", "3. 打开厂家驱动，让它显示一次电量。"),
+            ("b", "4. 点「停止」，填入刚才看到的电量。"),
+            ("b", "5. 只有一个字节符合，就直接保存这个字节作为电量。"),
+            ("b", "6. 多个字节符合时，换一个电量再抓一次，对比差值。"),
+            ("b", "7. 保存后，以后插上就能直接读电量。"),
             ("h", "如果多次都没有电量数据"),
             ("b", "可能厂家的协议做了加密，这方面需要用户自行解决。"),
-            ("b", "并确认抓包期间厂家驱动显示过电量，且设备没有休眠。"),
         ]
         y = 96
         for kind, text in lines:
@@ -2418,21 +2615,7 @@ class HelpWindow:
         if self._ambiguous:
             self._cap_button(242, 400, 100, 30, "清理抓包", "cap_clear",
                              enabled=not self._capturing)
-        self._cap_button(28, 438, 140, 30, "选择路径…", "cap_path")
-        cv.create_text(196, 453, text="USBPcap 官网", anchor="w",
-                       fill=_rgb((90, 170, 240)), font=self._f(9, True),
-                       tags=("cap_site",))
-        wlink = tkfont.Font(family=FONT,
-                            size=-int(round(9 * self.S))).measure("USBPcap 官网") / self.S
-        cv.create_line(196, 458, 196 + wlink, 458,
-                       fill=_rgb((90, 170, 240)), width=1,
-                       tags=("cap_site",))
-        cv.tag_bind("cap_site", "<Button-1>", lambda e: self._open_site())
-        cv.tag_bind("cap_site", "<Enter>",
-                    lambda e: cv.configure(cursor="hand2"))
-        cv.tag_bind("cap_site", "<Leave>",
-                    lambda e: cv.configure(cursor=""))
-        cv.create_text(28, 474, text=self._cap_status, anchor="nw",
+        cv.create_text(28, 450, text=self._cap_status, anchor="nw",
                        fill=_rgb((150, 153, 158)), font=self._f(8),
                        width=(W - 56), justify="left")
         cv.scale("all", 0, 0, self.S, self.S)
@@ -2556,7 +2739,15 @@ class HelpWindow:
         self.render()
 
     def _find_usbpcap(self):
-        return usbpcap_path()
+        p = usbpcap_path()
+        if p and os.path.isfile(p):
+            return p
+        for c in (r"C:\Program Files\USBPcap\USBPcapCMD.exe",
+                  r"C:\Program Files (x86)\USBPcap\USBPcapCMD.exe"):
+            if os.path.isfile(c):
+                set_usbpcap_path(c)
+                return c
+        return ""
 
     def _path_status(self):
         p = usbpcap_path()
@@ -2589,7 +2780,7 @@ class HelpWindow:
             return
         cmd = self._find_usbpcap()
         if not cmd:
-            self._cap_status = "请先选择 USBPcapCMD.exe"
+            self._cap_status = "未找到 USBPcapCMD.exe，请先安装 USBPcap"
             self.render()
             return
         outdir = os.path.join(tempfile.gettempdir(), "BatteryTrayCapture")
@@ -2609,11 +2800,10 @@ class HelpWindow:
                       f'{self.target_pid:04X} "{outdir}" "{stop_file}" '
                       f'"{status_file}"')
         else:
-            helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "capture_helper.py")
-            params = (f'"{helper}" "{cmd}" {self.target_vid:04X} '
-                      f'{self.target_pid:04X} "{outdir}" "{stop_file}" '
-                      f'"{status_file}"')
+            script = os.path.abspath(__file__)
+            params = (f'"{script}" --capture-helper "{cmd}" '
+                      f'{self.target_vid:04X} {self.target_pid:04X} '
+                      f'"{outdir}" "{stop_file}" "{status_file}"')
         sei = _SHELLEXECUTEINFOW()
         sei.cbSize = ctypes.sizeof(sei)
         sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
@@ -2759,19 +2949,12 @@ class HelpWindow:
 
             if proto:
                 vid, pid = devs[0]
-                ok, msg = validate_protocol(proto, vid, pid, int(lv))
-                if not ok:
-                    self._ambiguous = False
-                    self._cap_a = None
-                    self._cap_status = f"推断结果未通过回读验证（{msg}），未保存"
-                    self.render()
-                    return
                 save_user_protocol(vid, pid, proto)
                 self._ambiguous = False
                 self._cap_a = None
                 self._cap_status = (
-                    f"已保存通用协议 {vid:04X}:{pid:04X}"
-                    f"（电量偏移 {proto['offset']}，{msg}）")
+                    f"已保存协议 {vid:04X}:{pid:04X}"
+                    f"（电量在第 {proto['offset']} 字节）")
                 try:
                     self.parent.app.refresh()
                 except Exception:
