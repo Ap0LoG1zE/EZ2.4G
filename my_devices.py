@@ -1669,44 +1669,122 @@ def infer_generic(samples: list) -> dict:
     }
 
 
-def infer_single_ex(level: int, frames: list):
-    """单次抓取推断；返回 (协议, 状态)：ok / none / ambiguous。"""
-    level = int(level)
-    if level <= 0:
-        return None, "none"
-    ins = [d for ep, _tr, d in frames
-           if (ep & 0x80) and ep != 0x80 and len(d) >= 8]
-    outs = [d for ep, _tr, d in frames
-            if not (ep & 0x80) and ep != 0 and len(d) >= 3]
-    if not ins or not outs:
-        return None, "none"
-    best = None
-    best_n = 0
-    maxlen = max(len(d) for d in ins)
-    for off in range(1, min(maxlen, 64)):
-        n = sum(1 for d in ins if len(d) > off and d[off] == level)
-        if n > best_n:
-            best_n = n
-            best = off
-    if best is None or best_n < 1:
-        return None, "none"
-    hit = [d for d in ins if len(d) > best and d[best] == level]
-    prefixes = {d[:2] for d in hit}
+def _looks_descriptor(d: bytes) -> bool:
+    return d[:2] in (b"\x12\x01", b"\x09\x02")
+
+
+def _split_frames(frames: list):
+    ins = []
+    outs = []
+    for idx, (ep, _tr, d) in enumerate(frames):
+        if not d:
+            continue
+        if ep & 0x80:
+            if len(d) >= 4 and not _looks_descriptor(d):
+                ins.append((idx, d))
+        elif ep != 0 and len(d) >= 3:
+            outs.append((idx, d))
+    return ins, outs
+
+
+def _match_offsets(ins: list, level: int) -> set:
+    out = set()
+    for _idx, d in ins:
+        for off in range(1, min(len(d), 64)):
+            if d[off] == level:
+                out.add(off)
+    return out
+
+
+def _requests_at(frames: list, ins: list, outs: list,
+                 off: int, level: int) -> list:
     reqs = []
-    for d in outs:
-        if d[:2] in prefixes and d not in reqs:
-            reqs.append(d)
+    oi = 0
+    last_idx = -1
+    last = None
+    for idx, d in ins:
+        while oi < len(outs) and outs[oi][0] < idx:
+            last_idx, last = outs[oi][0], outs[oi][1]
+            oi += 1
+        if len(d) <= off or d[off] != level:
+            continue
+        if last is not None and idx - last_idx <= 80 and last not in reqs:
+            reqs.append(last)
     if not reqs:
-        for d in outs:
-            if d not in reqs:
-                reqs.append(d)
-    if len(prefixes) > 1 or len({d[:2] for d in reqs}) > 1:
-        return None, "ambiguous"
+        prefixes = {d[:2] for _i, d in ins
+                    if len(d) > off and d[off] == level}
+        reqs = [d for _i, d in outs if d[:2] in prefixes]
+    if not reqs:
+        reqs = [d for _i, d in outs]
+    return reqs[:6]
+
+
+def _proto_at(reqs: list, off: int) -> dict:
     return {
         "requests": [" ".join(f"{b:02X}" for b in d[:32])
                      for d in reqs[:6]],
-        "offset": best,
-    }, "ok"
+        "offset": off,
+    }
+
+
+def infer_single_ex(level: int, frames: list):
+    """单次抓取：唯一字节位置直接采用，多个位置返回 ambiguous。"""
+    level = int(level)
+    if level <= 0:
+        return None, "none"
+    ins, outs = _split_frames(frames)
+    if not ins or not outs:
+        return None, "none"
+    offs = _match_offsets(ins, level)
+    if not offs:
+        return None, "none"
+    if len(offs) > 1:
+        return None, "ambiguous"
+    off = next(iter(offs))
+    reqs = _requests_at(frames, ins, outs, off, level)
+    if not reqs:
+        return None, "none"
+    return _proto_at(reqs, off), "ok"
+
+
+def infer_two(level_a: int, frames_a: list,
+              level_b: int, frames_b: list):
+    """两次不同电量：只保留两个电量都出现在同一偏移、同一前缀的字节。"""
+    level_a = int(level_a)
+    level_b = int(level_b)
+    if level_a <= 0 or level_b <= 0 or level_a == level_b:
+        return None, "none"
+    ins_a, outs_a = _split_frames(frames_a)
+    ins_b, outs_b = _split_frames(frames_b)
+    if not ins_a or not ins_b:
+        return None, "none"
+    offs_a = _match_offsets(ins_a, level_a)
+    offs_b = _match_offsets(ins_b, level_b)
+    common = offs_a & offs_b
+    if not common:
+        return None, "none"
+
+    candidates = {}
+    for off in common:
+        pa = {d[:2] for _i, d in ins_a
+              if len(d) > off and d[off] == level_a}
+        pb = {d[:2] for _i, d in ins_b
+              if len(d) > off and d[off] == level_b}
+        shared = pa & pb
+        if shared:
+            candidates[off] = shared
+    if not candidates:
+        return None, "none"
+    if len(candidates) > 1:
+        return None, "ambiguous"
+
+    off = next(iter(candidates))
+    reqs = _requests_at(frames_a, ins_a, outs_a, off, level_a)
+    if not reqs:
+        reqs = _requests_at(frames_b, ins_b, outs_b, off, level_b)
+    if not reqs:
+        return None, "none"
+    return _proto_at(reqs, off), "ok"
 
 
 def infer_single(level: int, frames: list) -> dict:
@@ -1766,95 +1844,119 @@ def _read_user_protocol(ifaces: list, proto: dict):
     return None
 
 
-def scan_pcap_devices(path: str) -> list:
-    """?USBPcap 生成?pcap 里扫 USB 设备描述符，返回 [(vid,pid)]?"""
-    out = []
+def _iter_pcap_packets(path: str):
+    """流式读取 USBPcap pcap，逐包产出 (bus, dev, ep, transfer, payload)。"""
     try:
-        with open(path, "rb") as f:
-            data = f.read()
+        f = open(path, "rb")
     except Exception:
-        return out
-    if len(data) < 24:
-        return out
-    off = 24
-    n = len(data)
-    seen = set()
-    while off + 16 <= n:
-        try:
-            _ts, _tu, incl, _orig = struct.unpack_from("<IIII", data, off)
-        except Exception:
-            break
-        off += 16
-        if incl <= 0 or off + incl > n:
-            break
-        pkt = data[off:off + incl]
-        off += incl
-        if len(pkt) < 31:
-            continue
-        hlen = pkt[0]
-        if hlen < 27 or hlen > 64 or len(pkt) < hlen:
-            continue
-        dlen = struct.unpack_from("<I", pkt, hlen - 4)[0]
-        payload = pkt[hlen:hlen + dlen]
-        for i in range(0, len(payload) - 17):
+        return
+    with f:
+        head = f.read(24)
+        if len(head) < 24:
+            return
+        while True:
+            ph = f.read(16)
+            if len(ph) < 16:
+                return
+            try:
+                _ts, _tu, incl, _orig = struct.unpack("<IIII", ph)
+            except Exception:
+                return
+            if incl <= 0 or incl > 64 * 1024 * 1024:
+                return
+            pkt = f.read(incl)
+            if len(pkt) < incl:
+                return
+            if len(pkt) < 27:
+                continue
+            try:
+                hlen = struct.unpack_from("<H", pkt, 0)[0]
+            except Exception:
+                continue
+            if not (27 <= hlen <= 600) or len(pkt) < hlen:
+                continue
+            dlen = struct.unpack_from("<I", pkt, 23)[0]
+            payload = pkt[hlen:hlen + dlen]
+            bus = struct.unpack_from("<H", pkt, 17)[0]
+            dev = struct.unpack_from("<H", pkt, 19)[0]
+            yield bus, dev, pkt[21], pkt[22], payload
+
+
+def scan_pcap_map(path: str) -> dict:
+    """返回 {(bus, device): (vid, pid)}，来自 pcap 里的设备描述符。"""
+    out = {}
+    for bus, dev, _ep, _tr, payload in _iter_pcap_packets(path):
+        for i in range(0, max(0, len(payload) - 11)):
             if payload[i] == 18 and payload[i + 1] == 1:
                 vid = payload[i + 8] | (payload[i + 9] << 8)
                 pid = payload[i + 10] | (payload[i + 11] << 8)
-                if vid and pid and (vid, pid) not in seen:
-                    seen.add((vid, pid))
-                    out.append((vid, pid))
+                if vid and pid:
+                    out[(bus, dev)] = (vid, pid)
+                break
     return out
 
 
-def extract_pcap_reports(path: str, limit: int = 300) -> list:
-    """提取 pcap 里的 HID 输入/输出帧（去重连续重）?"""
+def scan_pcap_devices(path: str) -> list:
+    """返回 pcap 里出现过的 [(vid, pid)]。"""
+    seen = []
+    for v in scan_pcap_map(path).values():
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+def extract_pcap_reports(path: str, target: set = None,
+                         limit: int = None) -> list:
+    """流式提取 HID 帧；target 为 {(bus, device)} 时只收目标设备。"""
     out = []
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except Exception:
-        return out
-    if len(data) < 24:
-        return out
-    off = 24
-    n = len(data)
-    while off + 16 <= n:
-        try:
-            _ts, _tu, incl, _orig = struct.unpack_from("<IIII", data, off)
-        except Exception:
-            break
-        off += 16
-        if incl <= 0 or off + incl > n:
-            break
-        pkt = data[off:off + incl]
-        off += incl
-        if len(pkt) < 27:
+    for bus, dev, ep, transfer, payload in _iter_pcap_packets(path):
+        if target is not None and (bus, dev) not in target:
             continue
-        hlen = struct.unpack_from("<H", pkt, 0)[0]
-        if not (27 <= hlen <= 600) or len(pkt) < hlen:
+        if len(payload) < 4:
             continue
-        dlen = struct.unpack_from("<I", pkt, 23)[0]
-        payload = pkt[hlen:hlen + dlen]
-        if len(payload) < 8:
-            continue
-        ep = pkt[21]
-        transfer = pkt[22]
-        # HID SET_REPORT 控制传输：把其中的报告本体当作 OUT 帧
+        # HID SET_REPORT 控制传输：把报告本体当作 OUT 帧
         if (ep == 0 and len(payload) >= 10
                 and payload[0] == 0x21 and payload[1] == 0x09):
             wlen = payload[6] | (payload[7] << 8)
             report = payload[8:8 + wlen]
-            if len(report) >= 3:
-                if not out or out[-1][2] != report:
-                    out.append((0x02, 1, report))
-                if len(out) >= limit:
-                    break
+            if len(report) >= 3 and (not out or out[-1][2] != report):
+                out.append((0x02, 1, report))
+            if limit and len(out) >= limit:
+                break
             continue
         if not out or out[-1][2] != payload:
             out.append((ep, transfer, payload))
-            if len(out) >= limit:
+            if limit and len(out) >= limit:
                 break
     return out
+
+
+def extract_pcap_for(path: str, vid: int, pid: int):
+    """只提取目标 VID:PID 的帧；找不到映射时退回全部帧。"""
+    mapping = scan_pcap_map(path)
+    targets = {k for k, v in mapping.items() if v == (vid, pid)} if vid else set()
+    frames = extract_pcap_reports(path, targets or None)
+    return frames, mapping
+
+
+def validate_protocol(proto: dict, vid: int, pid: int, level: int):
+    """用推断出的协议回读一次，必须与填入电量一致才允许保存。"""
+    try:
+        ifaces = [d for d in enumerate_hid()
+                  if d.vid == vid and d.pid == pid]
+    except Exception as e:
+        return False, f"枚举失败：{e}"
+    if not ifaces:
+        return False, "没有找到设备接口"
+    try:
+        r = _read_user_protocol(ifaces, proto)
+    except Exception as e:
+        return False, f"回读异常：{e}"
+    if not r or not r.ok or r.level is None:
+        return False, "回读失败"
+    if abs(int(r.level) - int(level)) <= 2:
+        return True, f"回读 {r.level}%"
+    return False, f"回读 {r.level}%，与填入 {level}% 不符"
 
 
 def format_reports(reports: list) -> str:
@@ -2243,6 +2345,7 @@ class HelpWindow:
         self._cap_status = self._path_status()
         self._cap_txt = ""
         self._ambiguous = False
+        self._cap_a = None
         self._purge_capture_files()
         self.render()
         try:
@@ -2424,6 +2527,13 @@ class HelpWindow:
                     f.write("1")
         except Exception:
             pass
+        if self._cap_proc:
+            try:
+                kernel32.TerminateProcess(self._cap_proc, 0)
+                kernel32.CloseHandle(self._cap_proc)
+            except Exception:
+                pass
+            self._cap_proc = None
         for p in (self._cap_file, getattr(self, "_cap_txt", ""),
                   self._cap_status_file, self._cap_stop):
             try:
@@ -2441,6 +2551,7 @@ class HelpWindow:
         self._cap_file = None
         self._cap_txt = ""
         self._ambiguous = False
+        self._cap_a = None
         self._cap_status = "已清理抓包，可以重新开始"
         self.render()
 
@@ -2547,6 +2658,16 @@ class HelpWindow:
         if state == "capturing":
             self._cap_status = f"正在抓包：USBPcap{hub}"
             self.render()
+        elif state == "busy":
+            self._capturing = False
+            self._cap_status = "抓包设备打不开（可能被其它抓包占用，或需要管理员权限）"
+            self.render()
+            return
+        elif state == "notraffic":
+            self._capturing = False
+            self._cap_status = "抓到了流量但没发现目标设备，请在抓包时拔插一次接收器"
+            self.render()
+            return
         elif state == "notfound":
             self._capturing = False
             self._cap_status = "没有在任何 USBPcap 接口上找到这台设备"
@@ -2554,7 +2675,7 @@ class HelpWindow:
             return
         elif state == "error":
             self._capturing = False
-            self._cap_status = "USBPcap 吊失败"
+            self._cap_status = "USBPcap 启动失败"
             self.render()
             return
         elif state == "done":
@@ -2589,7 +2710,11 @@ class HelpWindow:
             detail = f"（{max(1, size // 1024)} KB）"
         except Exception:
             detail = "（没有生成文件）"
-        frames = extract_pcap_reports(self._cap_file)
+        if self.target_vid:
+            frames, _mapping = extract_pcap_for(
+                self._cap_file, self.target_vid, self.target_pid)
+        else:
+            frames = extract_pcap_reports(self._cap_file)
         self._cap_txt = ""
         if frames:
             txt = os.path.splitext(self._cap_file)[0] + ".txt"
@@ -2620,29 +2745,60 @@ class HelpWindow:
                 self._cap_status = "已停止，但没有填写电量，未记录本次抓包"
                 self.render()
                 return
-            proto, why = infer_single_ex(int(lv), frames)
+            second = self._cap_a is not None
+            if second:
+                lv_a, frames_a = self._cap_a
+                if int(lv) == int(lv_a):
+                    self._ambiguous = True
+                    self._cap_status = "两次电量相同，请换一个相差至少 10% 的电量再抓一次"
+                    self.render()
+                    return
+                proto, why = infer_two(lv_a, frames_a, int(lv), frames)
+            else:
+                proto, why = infer_single_ex(int(lv), frames)
+
             if proto:
                 vid, pid = devs[0]
+                ok, msg = validate_protocol(proto, vid, pid, int(lv))
+                if not ok:
+                    self._ambiguous = False
+                    self._cap_a = None
+                    self._cap_status = f"推断结果未通过回读验证（{msg}），未保存"
+                    self.render()
+                    return
                 save_user_protocol(vid, pid, proto)
                 self._ambiguous = False
+                self._cap_a = None
                 self._cap_status = (
                     f"已保存通用协议 {vid:04X}:{pid:04X}"
-                    f"（电量偏移 {proto['offset']}）")
+                    f"（电量偏移 {proto['offset']}，{msg}）")
                 try:
                     self.parent.app.refresh()
                 except Exception:
                     pass
                 self.render()
                 return
+
             if why == "ambiguous":
+                self._cap_a = (int(lv), frames)
                 self._ambiguous = True
-                self._cap_status = "匹配不准确，请在设备电量变化至少10%后再抓取一次"
+                if second:
+                    self._cap_status = "两次仍匹配到多个字节，请再换一个电量抓取"
+                else:
+                    self._cap_status = "检测到多个电量字节，请换一个相差至少 10% 的电量再抓一次"
                 self.render()
                 return
-            self._ambiguous = False
-            self._cap_status = "没有匹配的电量数据，可能是操作不规范，请重复操作一遍"
+
+            if second:
+                self._cap_a = None
+                self._ambiguous = False
+                self._cap_status = "两次抓包没有找到随电量变化的字节，请重新抓取"
+            else:
+                self._ambiguous = False
+                self._cap_status = "没有匹配的电量数据，可能是操作不规范，请重复操作一遍"
             self.render()
             return
+
         self._ambiguous = False
         parts = [f"已停止：{os.path.basename(self._cap_file)}{detail}"]
         if devs:
@@ -2669,6 +2825,13 @@ class HelpWindow:
                 if self._cap_stop:
                     with open(self._cap_stop, "w", encoding="utf-8") as f:
                         f.write("1")
+            if self._cap_proc:
+                try:
+                    kernel32.TerminateProcess(self._cap_proc, 0)
+                    kernel32.CloseHandle(self._cap_proc)
+                except Exception:
+                    pass
+                self._cap_proc = None
             self._purge_capture_files()
         except Exception:
             pass

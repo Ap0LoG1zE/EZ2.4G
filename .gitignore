@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 本地备份与开发产物
+backups/
+feedback/
+feedback_logs.zip
+capture_states/
+my_devices.corrupt.py
+my_devices_recovered.pyc
+dist/
+build/
+*.spec
+release/
+*.log
+
+# 系统
+Thumbs.db
+desktop.ini

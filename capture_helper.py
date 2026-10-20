@@ -1,4 +1,4 @@
-﻿import ctypes
+import ctypes
 import ctypes.wintypes as w
 import json
 import os
@@ -41,7 +41,7 @@ def scan_devices(path):
         hlen = struct.unpack_from("<H", pkt, 0)[0]
         if not (27 <= hlen <= 600) or len(pkt) < hlen:
             continue
-        dlen = struct.unpack_from("<I", pkt, hlen - 4)[0]
+        dlen = struct.unpack_from("<I", pkt, 23)[0]
         payload = pkt[hlen:hlen + dlen]
         for i in range(0, len(payload) - 17):
             if payload[i] == 18 and payload[i + 1] == 1:
@@ -61,7 +61,62 @@ def hub_exists(n):
     return err == 5
 
 
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong)]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", w.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", w.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", w.DWORD),
+                ("SchedulingClass", w.DWORD)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation",
+                 _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+_JOB = None
+
+
+def _setup_job():
+    """把自己放进 kill-on-close 的 Job，进程退出时连带收掉 USBPcapCMD。"""
+    global _JOB
+    try:
+        k32.CreateJobObjectW.restype = w.HANDLE
+        k32.GetCurrentProcess.restype = w.HANDLE
+        k32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+        k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                    ctypes.sizeof(info))
+        k32.AssignProcessToJobObject(job, k32.GetCurrentProcess())
+        _JOB = job
+    except Exception:
+        _JOB = None
+
+
 def main():
+    _setup_job()
     (cp, vid_s, pid_s, outdir, stop_flag, status_file) = sys.argv[1:7]
     vid = int(vid_s, 16)
     pid = int(pid_s, 16)
@@ -77,6 +132,7 @@ def main():
 
     hubs = [n for n in range(1, 7) if hub_exists(n)]
     status("probing")
+    any_bytes = False
     found = 0
     if vid:
         for hub in hubs:
@@ -89,13 +145,22 @@ def main():
                 p = subprocess.Popen(
                     [cp, "-d", "\\\\.\\USBPcap%d" % hub, "-A",
                      "--inject-descriptors", "-o", probe],
-                    creationflags=CREATE_NO_WINDOW)
+                    creationflags=CREATE_NO_WINDOW,
+                    stderr=subprocess.DEVNULL)
             except Exception:
                 continue
-            time.sleep(1.5)
+            time.sleep(4.0)
             try:
                 p.terminate()
-                p.wait(2)
+                p.wait(3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            try:
+                if os.path.getsize(probe) > 0:
+                    any_bytes = True
             except Exception:
                 pass
             devs = scan_devices(probe)
@@ -103,7 +168,7 @@ def main():
                 found = hub
                 break
         if not found:
-            status("notfound")
+            status("notraffic" if any_bytes else "busy")
             return
     else:
         found = hubs[0] if hubs else 1
@@ -114,19 +179,32 @@ def main():
         p = subprocess.Popen(
             [cp, "-d", "\\\\.\\USBPcap%d" % found, "-A",
              "--inject-descriptors", "-o", final],
-            creationflags=CREATE_NO_WINDOW)
+            creationflags=CREATE_NO_WINDOW,
+            stderr=subprocess.DEVNULL)
     except Exception:
         status("error")
         return
+    started = time.time()
     while not os.path.exists(stop_flag):
         if p.poll() is not None:
             break
+        if time.time() - started > 180:
+            break
+        try:
+            if os.path.getsize(final) > 256 * 1024 * 1024:
+                break
+        except Exception:
+            pass
         time.sleep(0.2)
     try:
         p.terminate()
         p.wait(3)
     except Exception:
-        pass
+        try:
+            p.kill()
+            p.wait(2)
+        except Exception:
+            pass
     status("done", found, final)
 
 
