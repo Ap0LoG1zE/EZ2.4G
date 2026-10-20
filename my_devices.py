@@ -1025,6 +1025,66 @@ def known_ids() -> set:
     return set()
 
 
+def device_key(vid: int, pid: int) -> str:
+    return f"x{vid:04X}{pid:04X}"
+
+
+def load_saved_devices() -> list:
+    raw = load_config().get("devices")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for d in raw:
+        try:
+            vid = int(d["vid"])
+            pid = int(d["pid"])
+        except Exception:
+            continue
+        out.append({"vid": vid, "pid": pid, "name": str(d.get("name", ""))})
+    return out
+
+
+def save_saved_devices(devs: list) -> None:
+    cfg = load_config()
+    cfg["devices"] = devs
+    save_config(cfg)
+
+
+def read_saved_device(dev: dict, ifaces=None) -> Reading:
+    vid = int(dev["vid"])
+    pid = int(dev["pid"])
+    name = dev.get("name") or ""
+    ifaces = ifaces if ifaces is not None else enumerate_hid()
+    cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
+    if not cand:
+        return Reading(ok=False, present=False,
+                       name=name or f"{vid:04X}:{pid:04X}",
+                       vid=vid, pid=pid, detail="未连接")
+    prod = next((d.product for d in cand if d.product), "")
+    if not name:
+        name = prod or f"{vid:04X}:{pid:04X}"
+    r = _unknown_reading(name, cand, skip_compat=False)
+    if not r or not r.ok:
+        proto = user_protocols().get(f"{vid:04X}:{pid:04X}")
+        if proto:
+            try:
+                rr = _read_user_protocol(cand, proto)
+                if rr and rr.ok:
+                    r = rr
+            except Exception:
+                pass
+    if r is None:
+        r = Reading(ok=False, present=True, name=name,
+                    status="unknown_proto", detail="协议未知，无法读取电量")
+    r.name = name
+    r.present = True
+    meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
+    r.vid, r.pid = vid, pid
+    r.usage_page = meta.usage_page
+    r.hid_known = True
+    return r
+
+
 def _unknown_reading(name: str, ifaces: list[HidIface],
                      skip_compat: bool = False) -> Reading:
     """对未记录设备做只读试掼失败则标记协讜知?"""
@@ -3031,8 +3091,210 @@ class HelpWindow:
         self.parent._help_win = None
 
 
+class AddDeviceWindow:
+    """发现新设备时的 DSH 风格确认窗口。"""
+
+    LW, LH = 380, 240
+
+    def __init__(self, app, vid: int, pid: int, name: str,
+                 level=None):
+        self.app = app
+        self.vid = vid
+        self.pid = pid
+        self.name = name
+        self.level = level
+        self.parent = app.panel
+        self.S = max(1.0, UI_SCALE)
+        self.W = int(self.LW * self.S)
+        self.H = int(self.LH * self.S)
+        self.root = tk.Toplevel(self.parent.root)
+        try:
+            self.root.transient(self.parent.root)
+        except Exception:
+            pass
+        self.root.overrideredirect(True)
+        self.root.configure(bg="#1B1B1C")
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
+                            highlightthickness=0, bd=0, bg="#1B1B1C")
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Button-1>", self._on_click)
+        self.root.update_idletasks()
+        set_round_region(self.root.winfo_id(), self.W, self.H,
+                         int(24 * self.S))
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = (sw - self.W) // 2
+        y = (sh - self.H) // 2
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        self.hwnd = self.root.winfo_id()
+        self.shadow = None
+        self.render()
+        try:
+            self.root.update_idletasks()
+            if self.shadow:
+                self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
+        except Exception:
+            pass
+
+    def _f(self, size, bold=False):
+        return (FONT, -int(round(size * self.S)),
+                "bold" if bold else "normal")
+
+    def render(self):
+        cv = self.cv
+        cv.delete("all")
+        cv.create_rectangle(0, 0, self.LW, self.LH,
+                            fill="#1B1B1C", outline="")
+        draw_round_rect(cv, 1, 1, self.LW - 1, self.LH - 1, 12,
+                        fill="", outline="#3C3C3C", width=2)
+        cv.create_text(24, 28, text="发现新设备", anchor="w",
+                       fill="#F5F5F7", font=self._f(16, True))
+        cv.create_text(24, 70, text=self.name or "未知设备", anchor="w",
+                       fill="#F5F5F7", font=self._f(14, True))
+        cv.create_text(24, 98, anchor="w",
+                       text=f"{self.vid:04X}:{self.pid:04X}",
+                       fill="#A0A3A8", font=self._f(9))
+        if self.level is not None:
+            cv.create_text(24, 122, text=f"当前电量 {self.level}%",
+                           anchor="w", fill="#22C55E",
+                           font=self._f(10, True))
+        cv.create_text(24, 152, text="添加设备后，双击设备名可以改名",
+                       anchor="w", fill="#787B80", font=self._f(8))
+        draw_round_rect(cv, 24, 188, 164, 222, 8,
+                        fill="#22C55E", outline="#22C55E",
+                        tags=("add",))
+        cv.create_text(94, 205, text="添加", fill="#121416",
+                       font=self._f(10, True), tags=("add",))
+        draw_round_rect(cv, 180, 188, 320, 222, 8,
+                        fill="#1B1B1C", outline="#303136", width=1,
+                        tags=("cancel",))
+        cv.create_text(250, 205, text="暂不", fill="#A0A3A8",
+                       font=self._f(10, True), tags=("cancel",))
+        cv.tag_bind("add", "<Button-1>", lambda e: self._done(True))
+        cv.tag_bind("cancel", "<Button-1>", lambda e: self._done(False))
+        for t in ("add", "cancel"):
+            cv.tag_bind(t, "<Enter>",
+                        lambda e: cv.configure(cursor="hand2"))
+            cv.tag_bind(t, "<Leave>", lambda e: cv.configure(cursor=""))
+        cv.scale("all", 0, 0, self.S, self.S)
+
+    def _on_click(self, e):
+        x = e.x / self.S
+        y = e.y / self.S
+        if 24 <= x <= 164 and 188 <= y <= 222:
+            self._done(True)
+        elif 180 <= x <= 320 and 188 <= y <= 222:
+            self._done(False)
+
+    def _done(self, ok: bool):
+        if ok:
+            try:
+                self.app.add_device(self.vid, self.pid, self.name)
+            except Exception:
+                pass
+        try:
+            if self.shadow:
+                self.shadow.destroy()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self.app._add_win = None
+
+
+class CardMenu:
+    """卡片右键菜单：DSH 风格的小按钮。"""
+
+    LW, LH = 140, 44
+
+    def __init__(self, panel, key, x_root, y_root):
+        self.panel = panel
+        self.key = key
+        self.S = panel.S
+        self.W = int(self.LW * self.S)
+        self.H = int(self.LH * self.S)
+        self.root = tk.Toplevel(panel.root)
+        try:
+            self.root.transient(panel.root)
+        except Exception:
+            pass
+        self.root.overrideredirect(True)
+        self.root.configure(bg="#1B1B1C")
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
+                            highlightthickness=0, bd=0, bg="#1B1B1C")
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Button-1>", lambda e: self._delete())
+        self.root.update_idletasks()
+        set_round_region(self.root.winfo_id(), self.W, self.H,
+                         int(16 * self.S))
+        self.root.geometry(f"{self.W}x{self.H}+{int(x_root)}+{int(y_root)}")
+        self.hwnd = self.root.winfo_id()
+        self.shadow = None
+        try:
+            self.shadow = ShadowWindow(self)
+        except Exception:
+            self.shadow = None
+        self.render()
+        try:
+            self.root.update_idletasks()
+            if self.shadow:
+                self.shadow.show(self.root.winfo_x(), self.root.winfo_y())
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            _top = user32.GetAncestor(self.hwnd, 2) or self.hwnd
+            user32.SetWindowPos(_top, -1, 0, 0, 0, 0, 0x0003)
+        except Exception:
+            pass
+
+    def render(self):
+        cv = self.cv
+        cv.create_rectangle(0, 0, self.LW, self.LH,
+                            fill="#1B1B1C", outline="")
+        draw_round_rect(cv, 1, 1, self.LW - 1, self.LH - 1, 8,
+                        fill="#1B1B1C", outline="#3C3C3C", width=2,
+                        tags=("del",))
+        cv.create_text(self.LW / 2, self.LH / 2, text="删除设备",
+                       fill="#F5F5F7", font=(FONT, -int(round(10 * self.S)),
+                                             "normal"), tags=("del",))
+        cv.tag_bind("del", "<Button-1>", lambda e: self._delete())
+        cv.tag_bind("del", "<Enter>",
+                    lambda e: cv.configure(cursor="hand2"))
+        cv.tag_bind("del", "<Leave>", lambda e: cv.configure(cursor=""))
+        cv.scale("all", 0, 0, self.S, self.S)
+
+    def _delete(self):
+        try:
+            self.panel.delete_device(self.key)
+        except Exception:
+            pass
+        self.close()
+
+    def close(self):
+        try:
+            if self.shadow:
+                self.shadow.destroy()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        if getattr(self.panel, "_menu", None) is self:
+            self.panel._menu = None
+
+
 class Panel:
-    LW, LH = 560, 432
+    LW, LH = 560, 399
 
     def _f(self, size, bold=False):
         return (FONT, -int(round(size * self.S)),
@@ -3068,6 +3330,9 @@ class Panel:
         self._name_max_chars = 0
         self._scroll = 0.0
         self._max_scroll = 0.0
+        self._card_rects = {}
+        self._menu = None
+        self.cv.bind("<Button-3>", self._on_right_click)
         self._track_h = 0.0
         self._thumb_h = 0.0
         self._bar_drag = None
@@ -3110,6 +3375,12 @@ class Panel:
 
     # -- 交互 --------------------------------------------------------------
     def _on_press(self, e):
+        if self._menu:
+            try:
+                self._menu.unpost()
+            except Exception:
+                pass
+            self._menu = None
         try:
             if getattr(self, "_shadow", None):
                 self._shadow.show(self.root.winfo_x(), self.root.winfo_y())
@@ -3328,10 +3599,49 @@ class Panel:
             cv.create_line(x1 + inset + 1, yy, x2 - inset - 1, yy,
                            fill=_rgb(c))
 
+    def _on_right_click(self, e):
+        if self._menu:
+            try:
+                self._menu.unpost()
+            except Exception:
+                pass
+            self._menu = None
+        ly = e.y / self.S
+        lx = e.x / self.S
+        for key, (x1, y1, x2, y2) in self._card_rects.items():
+            if x1 <= lx <= x2 and y1 <= ly <= y2:
+                menu = tk.Menu(
+                    self.root, tearoff=0, bg="#1B1B1C", fg="#F5F5F7",
+                    activebackground="#2A2B2E",
+                    activeforeground="#F5F5F7", bd=0, relief="flat")
+                menu.add_command(
+                    label="删除设备",
+                    command=lambda k=key: self.delete_device(k))
+                self._menu = menu
+                menu.bind("<Unmap>", lambda ev: self._clear_menu())
+                menu.tk_popup(e.x_root, e.y_root)
+                return
+
+    def _clear_menu(self):
+        self._menu = None
+
+    def delete_device(self, key: str):
+        if self._menu:
+            try:
+                self._menu.unpost()
+            except Exception:
+                pass
+            self._menu = None
+        try:
+            self.app.remove_device(key)
+        except Exception:
+            pass
+
     def _card(self, x1, y1, x2, y2, key):
         cv = self.cv
+        self._card_rects[key] = (x1, y1, x2, y2)
         r = (self.app.snapshot().get(key)
-             or Reading(ok=False, name=DEVICES[0 if key == "mouse" else 1].name))
+             or Reading(ok=False, name="设备"))
         rad = 20
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         base = self._scene_at(cx, cy)
@@ -3472,13 +3782,14 @@ class Panel:
         cv.create_rectangle(0, 0, W, H, fill=_rgb(self.DSH_BG), outline="")
 
         snap = self.app.snapshot()
-        present = [k for k, v in snap.items() if v and v.present]
-        content = (len(present) * 134 - 12) if present else 122
+        keys = list(snap.keys())
+        self._card_rects = {}
+        content = (len(keys) * 134 - 12) if keys else 122
         self._max_scroll = max(0.0, content - 256.0)
         self._scroll = max(0.0, min(self._scroll, self._max_scroll))
         y = 88 - self._scroll
-        if present:
-            for key in present:
+        if keys:
+            for key in keys:
                 self._card(24, y, W - 24, y + 122, key)
                 y += 134
         else:
@@ -3495,19 +3806,18 @@ class Panel:
                    else f"每 {iv} 秒自动刷新")
         cv.create_text(30, 56, text="2.4G 无线外设 · " + iv_text, anchor="w",
                        fill=_rgb(self.DSH_SUB), font=self._f(9))
-        self._button(W - 44, 20, 28, 28, "✕", self.hide, kind="close")
         self._scrollbar()
 
-        upd = self._ctext(24, 378, self._updated_text(), _rgb(self.DSH_MUTED),
+        upd = self._ctext(24, 372, self._updated_text(), _rgb(self.DSH_MUTED),
                           self._f(9), anchor="w", tags=("upd_btn",))
         cv.tag_bind("upd_btn", "<Button-1>", lambda e: self.app.refresh())
         cv.tag_bind("upd_btn", "<Enter>",
                     lambda e: cv.configure(cursor="hand2"))
         cv.tag_bind("upd_btn", "<Leave>",
                     lambda e: cv.configure(cursor=""))
-        self._check(380, 378, self._startup_var, "开机自启",
+        self._check(380, 372, self._startup_var, "开机自启",
                     lambda: self._toggle_startup())
-        self._button(484, 366, 52, 24, "退出", self.app.quit, kind="ghost")
+        self._button(472, 360, 64, 24, "最小化", self.hide, kind="ghost")
         cv.scale("all", 0, 0, self.S, self.S)
 
     def _draw_border(self):
@@ -3583,8 +3893,9 @@ class Panel:
 
     def _card(self, x1, y1, x2, y2, key):
         cv = self.cv
+        self._card_rects[key] = (x1, y1, x2, y2)
         r = (self.app.snapshot().get(key)
-             or Reading(ok=False, name=DEVICES[0 if key == "mouse" else 1].name))
+             or Reading(ok=False, name="设备"))
         draw_round_rect(cv, x1, y1, x2, y2, 12,
                         fill=_rgb(self.DSH_CARD), outline=_rgb(self.DSH_BORDER),
                         width=1)
@@ -3600,7 +3911,11 @@ class Panel:
         hid = (f"0x{r.usage_page:04X}"
                if (r.hid_known and r.usage_page) else "未知")
         line = f"{meta} · HID ({hid})"
-        if unknown:
+        if r.stale:
+            cv.create_text(x1 + 18, y1 + 46,
+                           text=r.detail or "上次更新", anchor="w",
+                           fill=_rgb(self.DSH_SUB), font=self._f(9))
+        elif unknown:
             text = f"{line}  协议未知，无法读取电量"
             cv.create_text(x1 + 18, y1 + 46, text=text, anchor="w",
                            fill=_rgb(self.DSH_SUB), font=self._f(9))
@@ -3648,6 +3963,9 @@ class Panel:
                         width=1)
         cv.create_text(x1 + 18, y1 + 22, text="请插入设备", anchor="w",
                        fill=_rgb(self.DSH_TEXT), font=self._f(12, True))
+        cv.create_text(x1 + 18, y1 + 46,
+                       text="或者拔插一下你想要添加的设备", anchor="w",
+                       fill=_rgb(self.DSH_SUB), font=self._f(9))
         bx1, bx2 = x1 + 18, x2 - 18
         by = y2 - 24
         draw_round_rect(cv, bx1, by, bx2, by + 6, 3,
@@ -3744,6 +4062,10 @@ class Panel:
                 pass
             self._entry_item = None
         if save:
+            try:
+                self.app.rename_device(key, text)
+            except Exception:
+                pass
             set_custom_name(key, text)
             if text:
                 try:
@@ -3858,6 +4180,8 @@ WM_TIMER = 0x0113
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_SETTINGCHANGE = 0x001A
+WM_DEVICECHANGE = 0x0219
+DBT_DEVNODES_CHANGED = 0x0007
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 
@@ -4085,6 +4409,10 @@ class Tray:
                 except Exception:
                     pass
             return 0
+        if msg == WM_DEVICECHANGE:
+            if wparam == DBT_DEVNODES_CHANGED:
+                self.app._hotplug_requested = True
+            return 0
         if msg == WM_APP_REFRESH:
             self.refresh_icons()
             return 0
@@ -4123,6 +4451,13 @@ class TrayApp:
         self._dirty = False
         self._show_requested = False
         self._full: dict[str, bool] = {}
+        self.devices = load_saved_devices()
+        self._seen = None
+        self._asked = set()
+        self._pending_add = None
+        self._add_win = None
+        self._last_poll = 0.0
+        self._hotplug_requested = False
 
     # -- 数据 --------------------------------------------------------------
     def snapshot(self) -> dict[str, Reading]:
@@ -4137,10 +4472,14 @@ class TrayApp:
 
     def _worker(self):
         try:
-            res = apply_last_known(read_all())
-        except Exception as e:
-            res = {k: Reading(ok=False, name=s.name, detail=f"读取异常：{e}")
-                   for k, s in (("mouse", DEVICES[0]), ("headset", DEVICES[1]))}
+            ifaces = enumerate_hid()
+            res = {}
+            for dev in self.devices:
+                key = device_key(dev["vid"], dev["pid"])
+                res[key] = read_saved_device(dev, ifaces)
+            res = apply_last_known(res)
+        except Exception:
+            res = {}
         with self._lock:
             self._readings = res
         self._check_full(res)
@@ -4188,12 +4527,81 @@ class TrayApp:
         if self.tray and self.tray.hwnd:
             user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
 
+    def _poll_hotplug(self, force: bool = False):
+        now = time.time()
+        if not force and now - self._last_poll < 10.0:
+            return
+        self._last_poll = now
+        try:
+            present = {(d.vid, d.pid) for d in enumerate_hid()}
+        except Exception:
+            return
+        if self._seen is None:
+            self._seen = present
+            self._asked = set(present)
+            return
+        new = present - self._seen
+        self._seen = present
+        self._asked &= present
+        for vid, pid in sorted(new):
+            if (vid, pid) in self._asked:
+                continue
+            if any(d["vid"] == vid and d["pid"] == pid
+                   for d in self.devices):
+                continue
+            self._asked.add((vid, pid))
+            self._pending_add = (vid, pid)
+            break
+
+    def _show_add(self, vid: int, pid: int):
+        try:
+            ifaces = enumerate_hid()
+            r = read_saved_device({"vid": vid, "pid": pid, "name": ""},
+                                  ifaces)
+            name = r.name or f"{vid:04X}:{pid:04X}"
+            level = r.level if r.ok else None
+            msg = f"设备：{name}\nVID:PID：{vid:04X}:{pid:04X}"
+            if level is not None:
+                msg += f"\n当前电量：{level}%"
+            msg += "\n\n添加设备后，双击设备名可以改名\n\n是否添加？"
+            if messagebox.askyesno("发现新设备", msg,
+                                   parent=self.panel.root):
+                self.add_device(vid, pid, name)
+        except Exception:
+            pass
+        self._add_win = None
+
+    def rename_device(self, key: str, name: str):
+        for d in self.devices:
+            if device_key(d["vid"], d["pid"]) == key:
+                d["name"] = name
+                save_saved_devices(self.devices)
+                break
+
+    def add_device(self, vid: int, pid: int, name: str):
+        if any(d["vid"] == vid and d["pid"] == pid for d in self.devices):
+            return
+        self.devices.append({"vid": vid, "pid": pid, "name": name})
+        save_saved_devices(self.devices)
+        self.refresh()
+
+    def remove_device(self, key: str):
+        self.devices = [d for d in self.devices
+                        if device_key(d["vid"], d["pid"]) != key]
+        save_saved_devices(self.devices)
+        with self._lock:
+            self._readings.pop(key, None)
+        self.refresh()
+
     def quit(self):
         self._stop = True
         if self.tray and self.tray.hwnd:
             user32.PostMessageW(self.tray.hwnd, WM_CLOSE, 0, 0)
         if self.panel:
-            self.panel.close()
+            try:
+                self.panel.hide()
+            except Exception:
+                pass
         try:
             self.root.quit()
         except Exception:
@@ -4209,6 +4617,15 @@ class TrayApp:
         self.refresh()
 
         def tick():
+            if self._hotplug_requested:
+                self._hotplug_requested = False
+                self._poll_hotplug(force=True)
+            else:
+                self._poll_hotplug()
+            if self._pending_add and self._add_win is None:
+                vid, pid = self._pending_add
+                self._pending_add = None
+                self._show_add(vid, pid)
             if self._show_requested:
                 self._show_requested = False
                 self.panel.show()
@@ -4225,6 +4642,12 @@ class TrayApp:
         if self.panel_only:
             self.panel.show()
         self.root.mainloop()
+        try:
+            if self.tray:
+                self.tray.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 APP_ID = "2.4GDevice.BatteryPanel"
