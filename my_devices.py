@@ -1073,9 +1073,17 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     r = rr
             except Exception:
                 pass
+    has_proto = f"{vid:04X}:{pid:04X}" in user_protocols()
     if r is None:
-        r = Reading(ok=False, present=True, name=name,
-                    status="unknown_proto", detail="协议未知，无法读取电量")
+        r = Reading(
+            ok=False, present=True, name=name,
+            status="asleep" if has_proto else "unknown_proto",
+            detail=("设备休眠或未响应" if has_proto
+                    else "协议未知，无法读取电量"))
+    elif not r.ok and has_proto:
+        r.status = "asleep"
+        r.source = "抓包协议"
+        r.detail = "设备休眠或未响应"
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -1211,7 +1219,7 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
             changed = True
             out[key] = r
             continue
-        if (not r.ok) and r.present and key in last:
+        if (not r.ok) and key in last:
             item = last[key]
             try:
                 level = int(item.get("level"))
@@ -3915,6 +3923,10 @@ class Panel:
             cv.create_text(x1 + 18, y1 + 46,
                            text=r.detail or "上次更新", anchor="w",
                            fill=_rgb(self.DSH_SUB), font=self._f(9))
+        elif r.status == "asleep":
+            cv.create_text(x1 + 18, y1 + 46,
+                           text=r.detail or "设备休眠", anchor="w",
+                           fill=_rgb(self.DSH_SUB), font=self._f(9))
         elif unknown:
             text = f"{line}  协议未知，无法读取电量"
             cv.create_text(x1 + 18, y1 + 46, text=text, anchor="w",
@@ -3943,6 +3955,9 @@ class Panel:
                            fill=_rgb(self.DSH_TEXT), font=self._f(30, True))
             cv.create_text(x2 - 24, y1 + 40, text="%", anchor="e",
                            fill=_rgb(self.DSH_SUB), font=self._f(11))
+        elif r.status == "asleep":
+            cv.create_text(x2 - 24, y1 + 40, text="休眠", anchor="e",
+                           fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
         elif not unknown:
             cv.create_text(x2 - 24, y1 + 40, text="未连接", anchor="e",
                            fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
