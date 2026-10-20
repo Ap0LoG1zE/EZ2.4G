@@ -1354,30 +1354,34 @@ def _level_color(level: Optional[int]) -> tuple[int, int, int]:
 
 def make_battery_icon(level: Optional[int], light: bool,
                       charging: bool = False, size: int = 32) -> int:
-    """size×size 玽电量图标 ?HICON?"""
+    """size×size 的电量圆环图标，4 倍超采样后缩小，边缘更圆。"""
+    SS = 4
+    big = size * SS
     hdc_screen = user32.GetDC(None)
     memdc = gdi32.CreateCompatibleDC(hdc_screen)
+    hbm_small = 0
+
     bmi = BITMAPINFO()
     bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.bmiHeader.biWidth = size
-    bmi.bmiHeader.biHeight = -size
+    bmi.bmiHeader.biWidth = big
+    bmi.bmiHeader.biHeight = -big
     bmi.bmiHeader.biPlanes = 1
     bmi.bmiHeader.biBitCount = 32
     bmi.bmiHeader.biCompression = 0
     bits = ctypes.c_void_p()
-    hbm = gdi32.CreateDIBSection(memdc, ctypes.byref(bmi), 0,
-                                 ctypes.byref(bits), None, 0)
-    old = gdi32.SelectObject(memdc, hbm)
+    hbm_big = gdi32.CreateDIBSection(memdc, ctypes.byref(bmi), 0,
+                                     ctypes.byref(bits), None, 0)
+    old = gdi32.SelectObject(memdc, hbm_big)
     try:
         key = COLORREF(255, 0, 255)
         bg = gdi32.CreateSolidBrush(key)
-        rect = wt.RECT(0, 0, size, size)
+        rect = wt.RECT(0, 0, big, big)
         user32.FillRect(memdc, ctypes.byref(rect), bg)
         gdi32.DeleteObject(bg)
 
-        # 玽电量：圈暗轨道 + 顺时针进度弧
-        s = size / 32.0
-        cx = cy = size / 2.0
+        # 电量：暗色轨道圆 + 顺时针进度弧
+        s = big / 32.0
+        cx = cy = big / 2.0
         radius = 12.0 * s
         thick = max(2, int(round(4 * s)))
         track = (95, 98, 105) if not light else (175, 180, 188)
@@ -1395,7 +1399,6 @@ def make_battery_icon(level: Optional[int], light: bool,
             pen_arc = gdi32.CreatePen(0, thick, COLORREF(r, g, b))
             gdi32.SelectObject(memdc, pen_arc)
             if level >= 100:
-                # 100% 画整圆，避免 Arc 起终点重合致不显示
                 gdi32.Ellipse(memdc, int(cx - radius), int(cy - radius),
                               int(cx + radius), int(cy + radius))
             else:
@@ -1409,32 +1412,59 @@ def make_battery_icon(level: Optional[int], light: bool,
             gdi32.DeleteObject(pen_arc)
 
         gdi32.SelectObject(memdc, old)
-        gdi32.DeleteObject(pen_track)
         gdi32.GdiFlush()
+        raw = ctypes.string_at(bits, big * big * 4)
 
-        raw = ctypes.string_at(bits, size * size * 4)
-        buf = bytearray(raw)
-        for i in range(0, len(buf), 4):
-            b_, g_, r_ = buf[i], buf[i + 1], buf[i + 2]
-            if (r_, g_, b_) == (255, 0, 255):
-                buf[i + 3] = 0
-            else:
-                buf[i + 3] = 255
-        ctypes.memmove(bits, bytes(buf), len(buf))
+        # 4×4 覆盖率降采样：每个目标像素统计非洋红比例作为 alpha
+        small = bytearray(size * size * 4)
+        for y in range(size):
+            for x in range(size):
+                cnt = 0
+                rs = gs = bs = 0
+                for yy in range(y * SS, (y + 1) * SS):
+                    base = yy * big * 4 + x * SS * 4
+                    for xx in range(SS):
+                        i = base + xx * 4
+                        b_, g_, r_ = raw[i], raw[i + 1], raw[i + 2]
+                        if (r_, g_, b_) != (255, 0, 255):
+                            cnt += 1
+                            rs += r_
+                            gs += g_
+                            bs += b_
+                o = (y * size + x) * 4
+                if cnt:
+                    small[o] = bs // cnt
+                    small[o + 1] = gs // cnt
+                    small[o + 2] = rs // cnt
+                    small[o + 3] = cnt * 255 // (SS * SS)
+
+        bmi2 = BITMAPINFO()
+        bmi2.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi2.bmiHeader.biWidth = size
+        bmi2.bmiHeader.biHeight = -size
+        bmi2.bmiHeader.biPlanes = 1
+        bmi2.bmiHeader.biBitCount = 32
+        bmi2.bmiHeader.biCompression = 0
+        bits2 = ctypes.c_void_p()
+        hbm_small = gdi32.CreateDIBSection(memdc, ctypes.byref(bmi2), 0,
+                                           ctypes.byref(bits2), None, 0)
+        gdi32.SelectObject(memdc, hbm_small)
+        ctypes.memmove(bits2, bytes(small), len(small))
 
         mask = gdi32.CreateBitmap(size, size, 1, 1, None)
         ii = ICONINFO()
         ii.fIcon = 1
         ii.hbmMask = mask
-        ii.hbmColor = hbm
+        ii.hbmColor = hbm_small
         icon = user32.CreateIconIndirect(ctypes.byref(ii))
         gdi32.DeleteObject(mask)
         return icon
     finally:
-        gdi32.DeleteObject(hbm)
+        if hbm_small:
+            gdi32.DeleteObject(hbm_small)
+        gdi32.DeleteObject(hbm_big)
         gdi32.DeleteDC(memdc)
         user32.ReleaseDC(None, hdc_screen)
-
 
 # ===========================================================================
 # 开机自启?/ 桌面链接 / 忍方式（纯 ctypes COM?# ===========================================================================
