@@ -1074,15 +1074,24 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             except Exception:
                 pass
     has_proto = f"{vid:04X}:{pid:04X}" in user_protocols()
+    has_builtin = any(
+        (d.usage_page == 0xFF02 and d.output_len >= 17) or
+        (d.output_len >= 64 and d.usage_page >= 0xFF00)
+        for d in cand)
+    try:
+        has_last = device_key(vid, pid) in _last_store()
+    except Exception:
+        has_last = False
+    supported = has_proto or has_builtin or has_last
     if r is None:
         r = Reading(
             ok=False, present=True, name=name,
-            status="asleep" if has_proto else "unknown_proto",
-            detail=("设备休眠或未响应" if has_proto
+            status="asleep" if supported else "unknown_proto",
+            detail=("设备休眠或未响应" if supported
                     else "协议未知，无法读取电量"))
-    elif not r.ok and has_proto:
+    elif not r.ok and supported:
         r.status = "asleep"
-        r.source = "抓包协议"
+        r.source = "抓包协议" if has_proto else "兼容厂商协议"
         r.detail = "设备休眠或未响应"
     r.name = name
     r.present = True
