@@ -1021,12 +1021,29 @@ def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
 
 
 def known_ids() -> set:
-    """当前仍识别?VID/PID；测试状态：全部忘?"""
+    """不再按 VID/PID 匹配内置设备；统一走标准 HID 或抓包协议。"""
     return set()
 
 
 def device_key(vid: int, pid: int) -> str:
     return f"x{vid:04X}{pid:04X}"
+
+
+def has_device_protocol(vid: int, pid: int) -> bool:
+    """只有保存过协议（标准 HID 或抓包）才算有协议。"""
+    return f"{vid:04X}:{pid:04X}" in user_protocols()
+
+
+def save_standard_protocol(vid: int, pid: int) -> None:
+    key = f"{vid:04X}:{pid:04X}"
+    cfg = load_config()
+    protos = cfg.get("protocols")
+    if not isinstance(protos, dict):
+        protos = {}
+    if key not in protos:
+        protos[key] = {"kind": "standard"}
+        cfg["protocols"] = protos
+        save_config(cfg)
 
 
 def load_saved_devices() -> list:
@@ -1059,38 +1076,49 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     if not cand:
         return Reading(ok=False, present=False,
                        name=name or f"{vid:04X}:{pid:04X}",
+                       status=("unplugged" if has_device_protocol(vid, pid)
+                               else "unknown_proto"),
                        vid=vid, pid=pid, detail="未连接")
     prod = next((d.product for d in cand if d.product), "")
     if not name:
         name = prod or f"{vid:04X}:{pid:04X}"
-    r = _unknown_reading(name, cand, skip_compat=False)
+    # 只允许两条路：标准 HID 直接读，或抓包保存的协议。
+    # 不再做厂商兼容试探，也不再按 VID/PID 匹配内置设备。
+    r = None
+    for d in cand:
+        try:
+            rr = read_standard_battery(d)
+        except Exception:
+            rr = None
+        if rr and rr.ok and rr.level is not None:
+            r = rr
+            break
+    key = f"{vid:04X}:{pid:04X}"
+    proto = user_protocols().get(key)
     if not r or not r.ok:
-        proto = user_protocols().get(f"{vid:04X}:{pid:04X}")
-        if proto:
+        if proto is not None and proto.get("kind", "captured") != "standard":
             try:
                 rr = _read_user_protocol(cand, proto)
                 if rr and rr.ok:
                     r = rr
             except Exception:
                 pass
-    has_proto = f"{vid:04X}:{pid:04X}" in user_protocols()
-    try:
-        has_last = device_key(vid, pid) in _last_store()
-    except Exception:
-        has_last = False
-    # 只有“抓过包”或“以前成功读到过”才算已支持；
-    # 仅接口长得像厂商 HID，不代表协议能读，不能标成休眠。
-    supported = has_proto or has_last
+    elif proto is None:
+        # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
+        save_standard_protocol(vid, pid)
+    supported = key in user_protocols()
     if r is None:
         r = Reading(
             ok=False, present=True, name=name,
             status="asleep" if supported else "unknown_proto",
-            detail=("设备休眠或未响应" if supported
+            detail=("设备休眠" if supported
                     else "协议未知，无法读取电量"))
     elif not r.ok and supported:
         r.status = "asleep"
-        r.source = "抓包协议" if has_proto else "兼容厂商协议"
-        r.detail = "设备休眠或未响应"
+        r.source = ("标准 HID 电量"
+                    if proto is not None and proto.get("kind") == "standard"
+                    else "抓包协议")
+        r.detail = "设备休眠"
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -1226,7 +1254,8 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
             changed = True
             out[key] = r
             continue
-        if (not r.ok) and key in last:
+        if ((not r.ok) and key in last
+                and r.status not in ("unknown_proto", "unplugged")):
             item = last[key]
             try:
                 level = int(item.get("level"))
@@ -1719,6 +1748,7 @@ def save_user_protocol(vid: int, pid: int, proto: dict) -> None:
     if not isinstance(protos, dict):
         protos = {}
     protos[f"{vid:04X}:{pid:04X}"] = {
+        "kind": "captured",
         "requests": list(proto.get("requests", [])),
         "offset": int(proto.get("offset", 2)),
     }
@@ -1940,6 +1970,87 @@ def _read_user_protocol(ifaces: list, proto: dict):
                     except Exception:
                         pass
     return None
+
+
+def _listen_user_protocol(ifaces: list, proto: dict,
+                          seconds: float = 1.5):
+    """被动监听输入报告：不发请求，只看设备自己上报的字节。"""
+    off = int(proto.get("offset", 2))
+    if off < 1:
+        return None
+    raw = proto.get("requests")
+    if not isinstance(raw, list):
+        raw = [proto.get("request", "")]
+    reqs = []
+    for s in raw:
+        try:
+            b = bytes.fromhex(str(s).replace(" ", ""))
+        except Exception:
+            continue
+        if b:
+            reqs.append(b)
+    req_ids = {b[0] for b in reqs}
+    for d in ifaces:
+        if d.input_len <= off:
+            continue
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=False)
+        except Exception:
+            continue
+        try:
+            deadline = time.monotonic() + seconds
+            seen = {}
+            first = None
+            while time.monotonic() < deadline:
+                rep = dev.read_input(max(64, d.input_len), 250)
+                if not rep or len(rep) <= off:
+                    continue
+                val = rep[off]
+                if not (0 <= val <= 100):
+                    continue
+                if first is None:
+                    first = (val, rep)
+                if req_ids and rep[0] in req_ids:
+                    return Reading(ok=True, level=val,
+                                   source="被动监听输入报告",
+                                   detail=f"报告 {rep[:8].hex(' ')}",
+                                   raw=rep)
+                seen[val] = seen.get(val, 0) + 1
+                if seen[val] >= 2:
+                    return Reading(ok=True, level=val,
+                                   source="被动监听输入报告",
+                                   detail=f"连续报告 {rep[:8].hex(' ')}",
+                                   raw=rep)
+            if first is not None:
+                return Reading(ok=True, level=first[0],
+                               source="被动监听输入报告",
+                               detail=f"单次报告 {first[1][:8].hex(' ')}",
+                               raw=first[1])
+        except Exception:
+            pass
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+    return None
+
+
+def _verify_saved_protocol(vid: int, pid: int, proto: dict):
+    """保存协议后立即验证：先主动回读，失败再被动监听。"""
+    try:
+        ifaces = [d for d in enumerate_hid()
+                  if d.vid == vid and d.pid == pid]
+    except Exception:
+        ifaces = []
+    if not ifaces:
+        return None
+    r = _read_user_protocol(ifaces, proto)
+    if r and r.ok:
+        return r
+    return _listen_user_protocol(ifaces, proto)
 
 
 def _iter_pcap_packets(path: str):
@@ -3055,11 +3166,21 @@ class HelpWindow:
             if proto:
                 vid, pid = devs[0]
                 save_user_protocol(vid, pid, proto)
+                verified = _verify_saved_protocol(vid, pid, proto)
                 self._ambiguous = False
                 self._cap_a = None
-                self._cap_status = (
-                    f"已保存协议 {vid:04X}:{pid:04X}"
-                    f"（电量在第 {proto['offset']} 字节）")
+                if verified is not None and verified.ok:
+                    self._cap_status = (
+                        f"已保存协议 {vid:04X}:{pid:04X}"
+                        f"（回读 {verified.level}%）")
+                else:
+                    cfg = load_config()
+                    protos = cfg.get("protocols")
+                    if isinstance(protos, dict):
+                        protos.pop(f"{vid:04X}:{pid:04X}", None)
+                        save_config(cfg)
+                    self._cap_status = (
+                        "抓包中不含电量数据，可能是没按要求让厂商软件发电量请求")
                 try:
                     self.parent.app.refresh()
                 except Exception:
@@ -4638,9 +4759,21 @@ class TrayApp:
         self.refresh()
 
     def remove_device(self, key: str):
+        removed = next((d for d in self.devices
+                        if device_key(d["vid"], d["pid"]) == key), None)
         self.devices = [d for d in self.devices
                         if device_key(d["vid"], d["pid"]) != key]
         save_saved_devices(self.devices)
+        if removed is not None:
+            cfg = load_config()
+            protocols = cfg.get("protocols")
+            if isinstance(protocols, dict):
+                protocols.pop(f"{removed['vid']:04X}:{removed['pid']:04X}",
+                              None)
+            last = cfg.get("last")
+            if isinstance(last, dict):
+                last.pop(key, None)
+            save_config(cfg)
         with self._lock:
             self._readings.pop(key, None)
         self.refresh()
