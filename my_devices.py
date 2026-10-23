@@ -1826,8 +1826,34 @@ def infer_generic(samples: list) -> dict:
     }
 
 
+_DESCRIPTOR_PREFIXES = (
+    b"\x12\x01",  # 设备描述符
+    b"\x09\x02",  # 配置描述符
+    b"\x09\x04",  # 接口描述符
+    b"\x07\x05",  # 端点描述符
+    b"\x09\x21",  # HID 描述符
+    b"\x05\x01",  # 报告描述符：通用桌面
+    b"\x05\x0c",  # 报告描述符：消费控制
+    b"\x06\x00",  # 报告描述符：厂商页
+    b"\x0a\x06",  # 设备限定符
+    b"\x07\x07",  # Other Speed 配置
+    b"\x0f\x05",  # BOS 描述符
+)
+
+
 def _looks_descriptor(d: bytes) -> bool:
-    return d[:2] in (b"\x12\x01", b"\x09\x02")
+    return len(d) >= 2 and d[:2] in _DESCRIPTOR_PREFIXES
+
+
+def _looks_control_setup(d: bytes, ep: int) -> bool:
+    """EP0 上不承载电量的标准控制请求。"""
+    if ep not in (0x00, 0x80) or len(d) != 8:
+        return False
+    # GET_DESCRIPTOR / SET_CONFIGURATION / SET_INTERFACE / CLEAR_FEATURE
+    return ((d[0] == 0x80 and d[1] == 0x06)
+            or (d[0] == 0x00 and d[1] == 0x09)
+            or (d[0] == 0x01 and d[1] == 0x0B)
+            or (d[0] == 0x02 and d[1] == 0x01))
 
 
 def _looks_string_descriptor(d: bytes, ep: int) -> bool:
@@ -1850,9 +1876,15 @@ def _split_frames(frames: list):
         if not d:
             continue
         if ep & 0x80:
-            if (len(d) >= 4 and not _looks_descriptor(d)
-                    and not _looks_string_descriptor(d, ep)):
-                ins.append((idx, d))
+            if len(d) < 4:
+                continue
+            if ep == 0x80 and (_looks_descriptor(d)
+                               or _looks_control_setup(d, ep)
+                               or _looks_string_descriptor(d, ep)):
+                continue
+            if not any(d):
+                continue
+            ins.append((idx, d))
         elif ep != 0 and len(d) >= 3:
             outs.append((idx, d))
     return ins, outs
