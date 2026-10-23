@@ -1519,11 +1519,16 @@ def startup_dir() -> str:
 
 
 def startup_lnk() -> str:
+    return os.path.join(startup_dir(), "2.4G.lnk")
+
+
+def legacy_startup_lnk() -> str:
     return os.path.join(startup_dir(), "电量托盘.lnk")
 
 
 def startup_enabled() -> bool:
-    return os.path.isfile(startup_lnk())
+    return (os.path.isfile(startup_lnk())
+            or os.path.isfile(legacy_startup_lnk()))
 
 
 def project_dir() -> str:
@@ -1602,18 +1607,33 @@ def install_startup() -> bool:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if getattr(sys, "frozen", False):
         create_shortcut(path, script_path(), "", project_dir(),
-                        "外设电量托盘", script_path())
+                        "2.4G", script_path())
     else:
         create_shortcut(path, pythonw_path(), f'"{script_path()}"',
-                        project_dir(), "外设电量托盘", pythonw_path())
+                        project_dir(), "2.4G", pythonw_path())
+    if os.path.isfile(path):
+        try:
+            os.remove(legacy_startup_lnk())
+        except FileNotFoundError:
+            pass
     return os.path.isfile(path)
 
 
 def remove_startup() -> None:
-    try:
-        os.remove(startup_lnk())
-    except FileNotFoundError:
-        pass
+    for p in (startup_lnk(), legacy_startup_lnk()):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
+def migrate_startup_link() -> None:
+    """把旧的“电量托盘.lnk”迁移成“2.4G.lnk”，指向当前程序。"""
+    if os.path.isfile(legacy_startup_lnk()):
+        try:
+            install_startup()
+        except Exception:
+            pass
 
 
 kernel32.CreateSymbolicLinkW.restype = wt.BOOL
@@ -1810,6 +1830,19 @@ def _looks_descriptor(d: bytes) -> bool:
     return d[:2] in (b"\x12\x01", b"\x09\x02")
 
 
+def _looks_string_descriptor(d: bytes, ep: int) -> bool:
+    """EP0 上的字符串描述符帧：设备身份文本（厂商/产品/序列号），
+    只是枚举期从设备读回来的 UTF-16 文本，绝不承载电量。
+    不过滤会拿文本里的字母撞值，例如 'd' = 0x64 = 100%。"""
+    if ep != 0x80:
+        return False
+    # 字符串描述符本体：bLength 必须等于实际长度，bDescriptorType = 0x03
+    if len(d) >= 2 and d[1] == 0x03 and d[0] == len(d):
+        return True
+    # GET_DESCRIPTOR 的 setup 阶段（80 06 ...，固定 8 字节）：只是请求包，不是数据
+    return len(d) == 8 and d[0] == 0x80 and d[1] == 0x06
+
+
 def _split_frames(frames: list):
     ins = []
     outs = []
@@ -1817,7 +1850,8 @@ def _split_frames(frames: list):
         if not d:
             continue
         if ep & 0x80:
-            if len(d) >= 4 and not _looks_descriptor(d):
+            if (len(d) >= 4 and not _looks_descriptor(d)
+                    and not _looks_string_descriptor(d, ep)):
                 ins.append((idx, d))
         elif ep != 0 and len(d) >= 3:
             outs.append((idx, d))
@@ -3472,7 +3506,7 @@ class Panel:
         self.W = int(self.LW * self.S)
         self.H = int(self.LH * self.S)
         self.root = tk.Tk()
-        self.root.title("外设电量")
+        self.root.title("2.4G")
         self.root.overrideredirect(True)
         self.root.configure(bg="#0B1322")
         self.light = app.theme_light
@@ -4450,7 +4484,7 @@ class Tray:
         wc.hInstance = hinst
         wc.lpszClassName = self.CLASS_NAME
         user32.RegisterClassW(ctypes.byref(wc))
-        self.hwnd = user32.CreateWindowExW(0, self.CLASS_NAME, "外设电量", 0,
+        self.hwnd = user32.CreateWindowExW(0, self.CLASS_NAME, "2.4G", 0,
                                            0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
             return
@@ -4520,13 +4554,14 @@ class Tray:
         name = (r.name if r and r.name else
                 (DEVICES[0].name if key == "mouse" else DEVICES[1].name))
         stamp = time.strftime("%H:%M", time.localtime(r.ts)) if r else "--:--"
-        tip = f"{name}：{r.level}%（{stamp}）" if (r and r.ok) else f"{name}：未连接（{stamp}）"
+        tip = (f"2.4G · {name}：{r.level}%（{stamp}）" if (r and r.ok)
+               else f"2.4G · {name}：未连接（{stamp}）")
         nid.szTip = tip[:127]
 
     def refresh_icons(self):
         self.sync_icons()
 
-    def notify(self, text: str, title: str = "外设电量") -> bool:
+    def notify(self, text: str, title: str = "2.4G") -> bool:
         """托盘气泡通知（Windows 通知丿也会收到），?64px 满绿玁图标?"""
         nid = self.nids.get(1)
         if nid is None:
@@ -4794,6 +4829,7 @@ class TrayApp:
 
     # -- 主循?------------------------------------------------------------
     def run(self):
+        migrate_startup_link()
         self.panel = Panel(self)
         self.root = self.panel.root
         if not self.panel_only:
@@ -4836,7 +4872,7 @@ class TrayApp:
 
 
 APP_ID = "2.4GDevice.BatteryPanel"
-APP_DISPLAY_NAME = "2.4G Device"
+APP_DISPLAY_NAME = "2.4G"
 
 
 def register_app_identity():
