@@ -1074,15 +1074,13 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             except Exception:
                 pass
     has_proto = f"{vid:04X}:{pid:04X}" in user_protocols()
-    has_builtin = any(
-        (d.usage_page == 0xFF02 and d.output_len >= 17) or
-        (d.output_len >= 64 and d.usage_page >= 0xFF00)
-        for d in cand)
     try:
         has_last = device_key(vid, pid) in _last_store()
     except Exception:
         has_last = False
-    supported = has_proto or has_builtin or has_last
+    # 只有“抓过包”或“以前成功读到过”才算已支持；
+    # 仅接口长得像厂商 HID，不代表协议能读，不能标成休眠。
+    supported = has_proto or has_last
     if r is None:
         r = Reading(
             ok=False, present=True, name=name,
