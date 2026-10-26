@@ -1240,6 +1240,14 @@ def _save_last(last: dict) -> None:
     save_config(cfg)
 
 
+def forget_last(vid: int, pid: int) -> None:
+    cfg = load_config()
+    last = cfg.get("last")
+    if isinstance(last, dict):
+        last.pop(device_key(vid, pid), None)
+        save_config(cfg)
+
+
 def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
     last = _last_store()
     changed = False
@@ -1388,6 +1396,26 @@ def _level_color(level: Optional[int]) -> tuple[int, int, int]:
     return (239, 68, 68)
 
 
+class _LogBrush(ctypes.Structure):
+    _fields_ = [("lbStyle", wt.UINT),
+                ("lbColor", wt.COLORREF),
+                ("lbHatch", ctypes.c_void_p)]
+
+
+def _ring_pen(rgb, width: int) -> int:
+    """平头几何画笔：圆弧端点不会额外探出，50% 就是正好 180°。"""
+    lb = _LogBrush()
+    lb.lbStyle = 0  # BS_SOLID
+    lb.lbColor = COLORREF(*rgb)
+    lb.lbHatch = 0
+    gdi32.ExtCreatePen.argtypes = [wt.DWORD, ctypes.c_int,
+                                   ctypes.POINTER(_LogBrush),
+                                   wt.DWORD, ctypes.c_void_p]
+    gdi32.ExtCreatePen.restype = wt.HPEN
+    return gdi32.ExtCreatePen(0x00010000 | 0x00000200, width,
+                              ctypes.byref(lb), 0, None)
+
+
 def make_battery_icon(level: Optional[int], light: bool,
                       charging: bool = False, size: int = 32) -> int:
     """size×size 的电量圆环图标，4 倍超采样后缩小，边缘更圆。"""
@@ -1421,7 +1449,7 @@ def make_battery_icon(level: Optional[int], light: bool,
         radius = 12.0 * s
         thick = max(2, int(round(4 * s)))
         track = (95, 98, 105) if not light else (175, 180, 188)
-        pen_track = gdi32.CreatePen(0, thick, COLORREF(*track))
+        pen_track = _ring_pen(track, thick)
         gdi32.SelectObject(memdc, pen_track)
         null_brush = gdi32.GetStockObject(5)  # NULL_BRUSH
         gdi32.SelectObject(memdc, null_brush)
@@ -1432,7 +1460,7 @@ def make_battery_icon(level: Optional[int], light: bool,
                 r, g, b = 34, 197, 94          # 充电：弧线绿色
             else:
                 r, g, b = _level_color(level)
-            pen_arc = gdi32.CreatePen(0, thick, COLORREF(r, g, b))
+            pen_arc = _ring_pen((r, g, b), thick)
             gdi32.SelectObject(memdc, pen_arc)
             if level >= 100:
                 gdi32.Ellipse(memdc, int(cx - radius), int(cy - radius),
@@ -1769,6 +1797,7 @@ def save_user_protocol(vid: int, pid: int, proto: dict) -> None:
         protos = {}
     protos[f"{vid:04X}:{pid:04X}"] = {
         "kind": "captured",
+        "invert": bool(proto.get("invert", False)),
         "requests": list(proto.get("requests", [])),
         "offset": int(proto.get("offset", 2)),
     }
@@ -2023,7 +2052,10 @@ def _read_user_protocol(ifaces: list, proto: dict):
                     if not rep or len(rep) <= off:
                         continue
                     if 0 <= rep[off] <= 100:
-                        return Reading(ok=True, level=rep[off],
+                        val = rep[off]
+                        if proto.get("invert"):
+                            val = 100 - val
+                        return Reading(ok=True, level=val,
                                        source="抓包协议",
                                        detail=f"回复 {rep[:8].hex(' ')}",
                                        raw=rep)
@@ -2102,6 +2134,29 @@ def _listen_user_protocol(ifaces: list, proto: dict,
                 except Exception:
                     pass
     return None
+
+
+def _validate_capture_protocol(proto: dict, vid: int, pid: int,
+                              level: int):
+    """返回 (模式, 回读结果)：direct / invert / None。"""
+    try:
+        ifaces = [d for d in enumerate_hid()
+                  if d.vid == vid and d.pid == pid]
+    except Exception:
+        ifaces = []
+    if not ifaces:
+        return None, None
+    r = _read_user_protocol(ifaces, proto)
+    if not r or not r.ok:
+        r = _listen_user_protocol(ifaces, proto)
+    if not r or not r.ok or r.level is None:
+        return None, r
+    raw = int(r.level)
+    if abs(raw - int(level)) <= 2:
+        return "direct", r
+    if abs((100 - raw) - int(level)) <= 2:
+        return "invert", r
+    return None, r
 
 
 def _verify_saved_protocol(vid: int, pid: int, proto: dict):
@@ -3231,20 +3286,26 @@ class HelpWindow:
 
             if proto:
                 vid, pid = devs[0]
-                save_user_protocol(vid, pid, proto)
-                verified = _verify_saved_protocol(vid, pid, proto)
+                mode, verified = _validate_capture_protocol(
+                    proto, vid, pid, int(lv))
                 self._ambiguous = False
                 self._cap_a = None
-                if verified is not None and verified.ok:
-                    self._cap_status = (
-                        f"已保存协议 {vid:04X}:{pid:04X}"
-                        f"（回读 {verified.level}%）")
+                if mode:
+                    saved = dict(proto)
+                    if mode == "invert":
+                        saved["invert"] = True
+                    save_user_protocol(vid, pid, saved)
+                    forget_last(vid, pid)
+                    if mode == "invert":
+                        self._cap_status = (
+                            f"已保存反向协议 {vid:04X}:{pid:04X}"
+                            f"（回读 {verified.level}% → "
+                            f"{100 - verified.level}%）")
+                    else:
+                        self._cap_status = (
+                            f"已保存协议 {vid:04X}:{pid:04X}"
+                            f"（回读 {verified.level}%）")
                 else:
-                    cfg = load_config()
-                    protos = cfg.get("protocols")
-                    if isinstance(protos, dict):
-                        protos.pop(f"{vid:04X}:{pid:04X}", None)
-                        save_config(cfg)
                     self._cap_status = (
                         "抓包中不含电量数据，可能是没按要求让厂商软件发电量请求")
                 try:
@@ -4571,8 +4632,7 @@ class Tray:
         r = self.app.snapshot().get(key)
         lvl = r.level if (r and r.ok) else None
         charging = bool(r and r.status == "charging")
-        k = (lvl is None, None if lvl is None else (lvl // 10), charging,
-             self.app.theme_light)
+        k = (lvl is None, lvl, charging, self.app.theme_light)
         old = self.icons.get(nid.uID)
         if self.icon_keys.get(nid.uID) != k or not old:
             icon = make_battery_icon(lvl, self.app.theme_light, charging)
