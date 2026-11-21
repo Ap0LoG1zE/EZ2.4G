@@ -1818,17 +1818,158 @@ def custom_names() -> dict:
     return names if isinstance(names, dict) else {}
 
 
-def usbpcap_path() -> str:
-    p = load_config().get("usbpcap")
-    if isinstance(p, str) and os.path.isfile(p):
-        return p
-    return ""
+_USBPCAP_NAME = "USBPcapCMD.exe"
+_USBPCAP_CACHE = {"path": None, "stamp": 0.0}
+_USBPCAP_CACHE_TTL = 30.0
+
+
+def _usbpcap_standard_dirs() -> list:
+    """所有盘符下的常见安装目录（不写死 C:，换盘也能找到）。"""
+    out = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        base = os.environ.get(env)
+        if base:
+            out.append(os.path.join(base, "USBPcap"))
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZAB":
+        root = f"{letter}:\\"
+        if not os.path.isdir(root):
+            continue
+        out.append(os.path.join(root, "Program Files", "USBPcap"))
+        out.append(os.path.join(root, "Program Files (x86)", "USBPcap"))
+    seen, uniq = set(), []
+    for d in out:
+        low = d.lower()
+        if low not in seen:
+            seen.add(low)
+            uniq.append(d)
+    return uniq
+
+
+def _usbpcap_from_registry() -> list:
+    """从卸载信息里找回安装目录：盘符或路径变了也能自愈。"""
+    out = []
+    try:
+        import winreg
+    except Exception:
+        return out
+    roots = ((winreg.HKEY_LOCAL_MACHINE,
+              r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_LOCAL_MACHINE,
+              r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+             (winreg.HKEY_CURRENT_USER,
+              r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+
+    def reg_str(key, field):
+        for i in range(64):
+            try:
+                name, value, _kind = winreg.EnumValue(key, i)
+            except OSError:
+                break
+            if name.lower() == field.lower() and isinstance(value, str):
+                return value
+        return ""
+
+    for hive, key_path in roots:
+        try:
+            key = winreg.OpenKey(hive, key_path)
+        except OSError:
+            continue
+        try:
+            for i in range(256):
+                try:
+                    sub_name = winreg.EnumKey(key, i)
+                except OSError:
+                    break
+                try:
+                    sub = winreg.OpenKey(key, sub_name)
+                except OSError:
+                    continue
+                try:
+                    if winreg.QueryValueEx(sub, "DisplayName")[0].lower().find(
+                            "usbpcap") < 0:
+                        continue
+                except OSError:
+                    continue
+                for field in ("InstallLocation", "DisplayIcon",
+                              "UninstallString"):
+                    raw = reg_str(sub, field).strip().strip('"')
+                    raw = raw.split('"')[0].strip()
+                    if not raw:
+                        continue
+                    folder = raw if os.path.isdir(raw) else os.path.dirname(raw)
+                    if folder:
+                        out.append(os.path.join(folder, _USBPCAP_NAME))
+                winreg.CloseKey(sub)
+        finally:
+            winreg.CloseKey(key)
+    return out
+
+
+def _usbpcap_candidates() -> list:
+    """依次尝试：已保存路径 → 自有 exe 目录 → 注册表 → 各盘标准目录 → PATH。"""
+    cands = []
+    saved = load_config().get("usbpcap")
+    if isinstance(saved, str) and saved:
+        cands.append(saved)
+    if getattr(sys, "frozen", False):
+        cands.append(os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)), _USBPCAP_NAME))
+    try:
+        cands.extend(_usbpcap_from_registry())
+    except Exception:
+        pass
+    for d in _usbpcap_standard_dirs():
+        cands.append(os.path.join(d, _USBPCAP_NAME))
+    try:
+        import shutil
+        w = shutil.which(_USBPCAP_NAME)
+        if w:
+            cands.append(w)
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for c in cands:
+        low = c.lower()
+        if low not in seen:
+            seen.add(low)
+            uniq.append(c)
+    return uniq
+
+
+def usbpcap_path(refresh: bool = False) -> str:
+    """返回可用的 USBPcapCMD.exe 路径。
+
+    不依赖配置里的绝对路径：保存的路径失效（换电脑/换盘/重装）后
+    自动按注册表、各盘标准目录、PATH 重新定位，并把新路径写回配置。
+    """
+    now = time.monotonic()
+    if (not refresh and _USBPCAP_CACHE["path"]
+            and now - _USBPCAP_CACHE["stamp"] < _USBPCAP_CACHE_TTL
+            and os.path.isfile(_USBPCAP_CACHE["path"])):
+        return _USBPCAP_CACHE["path"]
+    found = ""
+    for c in _usbpcap_candidates():
+        if os.path.isfile(c):
+            found = c
+            break
+    _USBPCAP_CACHE["path"] = found
+    _USBPCAP_CACHE["stamp"] = now
+    if found:
+        saved = load_config().get("usbpcap")
+        if saved != found:
+            try:
+                set_usbpcap_path(found)
+            except Exception:
+                pass
+    return found
 
 
 def set_usbpcap_path(path: str) -> None:
     cfg = load_config()
     cfg["usbpcap"] = path
     save_config(cfg)
+    _USBPCAP_CACHE["path"] = path
+    _USBPCAP_CACHE["stamp"] = time.monotonic()
 
 
 def user_protocols() -> dict:
@@ -2511,6 +2652,13 @@ def _helper_main():
         except Exception:
             pass
 
+    # 父进程传来的路径若在提权后失效（换盘/换机/重装），这里再自愈一次
+    if not os.path.isfile(cp):
+        cp = usbpcap_path(refresh=True) or cp
+    if not os.path.isfile(cp):
+        status("nousbpcap")
+        return
+
     hubs = [n for n in range(1, 7) if _helper_hub_exists(n)]
     status("probing")
     any_bytes = False
@@ -3122,20 +3270,17 @@ class HelpWindow:
         self.render()
 
     def _find_usbpcap(self):
-        p = usbpcap_path()
-        if p and os.path.isfile(p):
-            return p
-        for c in (r"C:\Program Files\USBPcap\USBPcapCMD.exe",
-                  r"C:\Program Files (x86)\USBPcap\USBPcapCMD.exe"):
-            if os.path.isfile(c):
-                set_usbpcap_path(c)
-                return c
-        return ""
+        # usbpcap_path() 自己会按注册表/各盘目录/PATH 重新定位，并能自愈失效的旧路径
+        return usbpcap_path(refresh=True)
 
     def _path_status(self):
         p = usbpcap_path()
         if not p:
-            return "未选择 USBPcap 路径"
+            saved = load_config().get("usbpcap")
+            if isinstance(saved, str) and saved:
+                shown = saved if len(saved) <= 56 else "…" + saved[-55:]
+                return f"USBPcap 路径已失效：{shown}（点「选择」重新指定）"
+            return "未找到 USBPcapCMD.exe，请先安装 USBPcap"
         shown = p if len(p) <= 56 else "…" + p[-55:]
         return f"USBPcap：{shown}"
 
@@ -3249,6 +3394,12 @@ class HelpWindow:
         elif state == "error":
             self._capturing = False
             self._cap_status = "USBPcap 启动失败"
+            self.render()
+            return
+        elif state == "nousbpcap":
+            self._capturing = False
+            self._cap_status = ("找不到 USBPcapCMD.exe，请在面板里点「选择」"
+                                "重新指定，或重装 USBPcap")
             self.render()
             return
         elif state == "done":
