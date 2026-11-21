@@ -1,0 +1,28 @@
+#include <windows.h>
+
+1 ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "Ap0LoG1zE"
+            VALUE "FileDescription", "2.4G 外设电量"
+            VALUE "FileVersion", "1.1.0.0"
+            VALUE "InternalName", "EZ2.4G"
+            VALUE "OriginalFilename", "EZ2.4G.exe"
+            VALUE "ProductName", "EZ2.4G"
+            VALUE "ProductVersion", "1.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
