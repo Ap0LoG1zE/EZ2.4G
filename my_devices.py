@@ -53,6 +53,7 @@ FILE_FLAG_OVERLAPPED = 0x40000000
 ERROR_IO_PENDING = 997
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
+CHARGE_JUMP = 20
 
 kernel32.CreateFileW.restype = wt.HANDLE
 kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
@@ -1046,6 +1047,34 @@ def save_standard_protocol(vid: int, pid: int) -> None:
         save_config(cfg)
 
 
+def _id_pair(text: str):
+    try:
+        a, b = str(text).split(":", 1)
+        return int(a, 16), int(b, 16)
+    except Exception:
+        return None
+
+
+def device_aliases() -> dict:
+    raw = load_config().get("aliases")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for src, dst in raw.items():
+        a = _id_pair(src)
+        b = _id_pair(dst)
+        if a and b:
+            out[f"{a[0]:04X}:{a[1]:04X}"] = f"{b[0]:04X}:{b[1]:04X}"
+    return out
+
+
+def ignored_ids() -> set:
+    raw = load_config().get("ignored")
+    if not isinstance(raw, list):
+        return set()
+    return {p for p in (_id_pair(x) for x in raw) if p}
+
+
 def load_saved_devices() -> list:
     raw = load_config().get("devices")
     if not isinstance(raw, list):
@@ -1072,10 +1101,26 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
     pid = int(dev["pid"])
     name = dev.get("name") or ""
     ifaces = ifaces if ifaces is not None else enumerate_hid()
-    cand = [d for d in ifaces if d.vid == vid and d.pid == pid]
+    key = f"{vid:04X}:{pid:04X}"
+    exact = [d for d in ifaces if d.vid == vid and d.pid == pid]
+    alias_cand = []
+    for src, dst in device_aliases().items():
+        if dst != key:
+            continue
+        pair = _id_pair(src)
+        if not pair:
+            continue
+        alt = [d for d in ifaces
+               if d.vid == pair[0] and d.pid == pair[1]]
+        if alt:
+            alias_cand = alt
+            break
+    # 有线别名优先，插线充电时直接读有线接口
+    cand = alias_cand or exact
+    alias_used = bool(alias_cand)
     if not cand:
         return Reading(ok=False, present=False,
-                       name=name or f"{vid:04X}:{pid:04X}",
+                       name=name or key,
                        status=("unplugged" if has_device_protocol(vid, pid)
                                else "unknown_proto"),
                        vid=vid, pid=pid, detail="未连接")
@@ -1093,7 +1138,6 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         if rr and rr.ok and rr.level is not None:
             r = rr
             break
-    key = f"{vid:04X}:{pid:04X}"
     proto = user_protocols().get(key)
     if not r or not r.ok:
         if proto is not None and proto.get("kind", "captured") != "standard":
@@ -1119,6 +1163,8 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     if proto is not None and proto.get("kind") == "standard"
                     else "抓包协议")
         r.detail = "设备休眠"
+    if alias_used and r.ok and r.source:
+        r.source = "有线别名 · " + r.source
     r.name = name
     r.present = True
     meta = next((d for d in cand if d.usage_page >= 0xFF00), cand[0])
@@ -4234,8 +4280,12 @@ class Panel:
         else:
             cv.create_text(x1 + 18, y1 + 46, text=line, anchor="w",
                            fill=_rgb(self.DSH_SUB), font=self._f(9))
-        lv = r.level if r.ok else None
-        if r.ok and lv is not None:
+        charging = bool(r.ok and r.status == "charging")
+        lv = 100 if charging else (r.level if r.ok else None)
+        if charging:
+            cv.create_text(x2 - 24, y1 + 40, text="充电中", anchor="e",
+                           fill=_rgb(self.DSH_TEXT), font=self._f(14, True))
+        elif r.ok and lv is not None:
             cv.create_text(x2 - 44, y1 + 40, text=str(lv), anchor="e",
                            fill=_rgb(self.DSH_TEXT), font=self._f(30, True))
             cv.create_text(x2 - 24, y1 + 40, text="%", anchor="e",
@@ -4632,10 +4682,12 @@ class Tray:
         r = self.app.snapshot().get(key)
         lvl = r.level if (r and r.ok) else None
         charging = bool(r and r.status == "charging")
-        k = (lvl is None, lvl, charging, self.app.theme_light)
+        # 充电中托盘也显示满环；提示仍用真实 lvl
+        icon_lvl = 100 if (r and r.ok and charging) else lvl
+        k = (lvl is None, icon_lvl, charging, self.app.theme_light)
         old = self.icons.get(nid.uID)
         if self.icon_keys.get(nid.uID) != k or not old:
-            icon = make_battery_icon(lvl, self.app.theme_light, charging)
+            icon = make_battery_icon(icon_lvl, self.app.theme_light, charging)
             self.icons[nid.uID] = icon
             self.icon_keys[nid.uID] = k
             nid.hIcon = icon
@@ -4758,6 +4810,7 @@ class TrayApp:
         self._add_win = None
         self._last_poll = 0.0
         self._hotplug_requested = False
+        self._charging = {}
 
     # -- 数据 --------------------------------------------------------------
     def snapshot(self) -> dict[str, Reading]:
@@ -4777,6 +4830,7 @@ class TrayApp:
             for dev in self.devices:
                 key = device_key(dev["vid"], dev["pid"])
                 res[key] = read_saved_device(dev, ifaces)
+            res = self._mark_charging(res, self.snapshot())
             res = apply_last_known(res)
         except Exception:
             res = {}
@@ -4787,6 +4841,36 @@ class TrayApp:
         self._dirty = True
         if self.tray and self.tray.hwnd:
             user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
+
+    def _mark_charging(self, res, prev):
+        """同一设备电量突然大幅跳变，才视为插入有线充电。"""
+        last = _last_store()
+        for key, r in res.items():
+            alias = bool(r.ok and r.source and
+                         r.source.startswith("有线别名"))
+            if not alias:
+                self._charging.pop(key, None)
+                continue
+            if self._charging.get(key):
+                r.status = "charging"
+                continue
+            prev_level = None
+            old = prev.get(key)
+            if old is not None and old.level is not None:
+                prev_level = old.level
+            if prev_level is None:
+                item = last.get(key)
+                if isinstance(item, dict):
+                    try:
+                        prev_level = int(item.get("level"))
+                    except Exception:
+                        prev_level = None
+            if (prev_level is not None and r.level is not None
+                    and abs(int(r.level) - int(prev_level)) >= CHARGE_JUMP):
+                self._charging[key] = True
+                self._full[key] = False
+                r.status = "charging"
+        return res
 
     def _check_full(self, res):
         """电量首?100% 时弹?Windows 通知；掉?97% 以下重新布防?"""
@@ -4845,6 +4929,8 @@ class TrayApp:
         self._asked &= present
         for vid, pid in sorted(new):
             if (vid, pid) in self._asked:
+                continue
+            if (vid, pid) in ignored_ids():
                 continue
             if any(d["vid"] == vid and d["pid"] == pid
                    for d in self.devices):
