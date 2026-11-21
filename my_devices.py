@@ -1021,6 +1021,95 @@ def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
     return out
 
 
+# ===========================================================================
+# 厂商协议表（来源：sdparklab/Voltide，MIT）
+#
+# 每条都是一次「写请求帧 → 读回复 → 取某字节」的查询，参数完全照抄
+# 上游的逆向结果；usage_page 用来锁定到底该往哪个 HID 集合发。
+# ===========================================================================
+VENDOR_PROFILES = [
+    # ATK A9 Air 大师+（鼠标）—— query[16] = (0x4D - sum(q[1..15])) & 0xFF
+    {"name": "ATK A9 Air", "vid": 0x373B, "pid": 0x1278,
+     "usage_page": 0xFF02, "frame": 17,
+     "request": [0x08, 0x04] + [0x00] * 14 + [0x49],
+     "offset": 6, "state_index": 7, "charging": 0x01,
+     "mv_index": 8, "set_report": True},
+
+    # 达尔优 A950（鼠标）
+    {"name": "Dareu A950", "vid": 0x260D, "pid": 0x1175,
+     "usage_page": 0xFF02, "frame": 17,
+     "request": [0x08, 0x04] + [0x00] * 14 + [0x49],
+     "offset": 6, "state_index": 7, "charging": 0x01,
+     "mv_index": 8, "set_report": True},
+
+    # VXE（鼠标），与 ATK 同方案
+    {"name": "VXE", "vid": 0x373B, "pid": 0x10C9,
+     "usage_page": 0xFF02, "frame": 17,
+     "request": [0x08, 0x04] + [0x00] * 14 + [0x49],
+     "offset": 6, "state_index": 7, "charging": 0x01,
+     "mv_index": 8, "set_report": True},
+
+    # Imecoo（鼠标），同上方案
+    {"name": "Imecoo", "vid": 0x3554, "pid": 0xFB34,
+     "usage_page": 0xFF02, "frame": 17,
+     "request": [0x08, 0x04] + [0x00] * 14 + [0x49],
+     "offset": 6, "state_index": 7, "charging": 0x01,
+     "mv_index": 8, "set_report": True},
+
+    # ATK N9V2 ULTIMATE（耳机）：55 65 <pct> <state>
+    {"name": "ATK N9V2", "vid": 0x373B, "pid": 0x1262,
+     "usage_page": 0xFF90, "frame": 64,
+     "request": [0x55, 0x65, 0x01] + [0x00] * 61,
+     "offset": 2, "state_index": 3,
+     "states": {0x02: "discharging", 0x03: "charging", 0x04: "full"}},
+
+    # MCHOSE V9 Turbo+（耳机）：3837:600A，FF90 集合
+    {"name": "MCHOSE V9 Turbo+", "vid": 0x3837, "pid": 0x600A,
+     "usage_page": 0xFF90, "frame": 64,
+     "request": [0x55, 0x65, 0x01] + [0x00] * 61,
+     "offset": 2, "state_index": 3,
+     "states": {0x02: "discharging", 0x03: "charging", 0x04: "full"}},
+
+    # MCHOSE V9 Turbo（耳机）：3837:600D，已在本机验证
+    {"name": "MCHOSE V9 Turbo", "vid": 0x3837, "pid": 0x600D,
+     "usage_page": 0xFF90, "frame": 64,
+     "request": [0x55, 0x65, 0x01] + [0x00] * 61,
+     "offset": 2, "state_index": 3,
+     "states": {0x02: "discharging", 0x03: "charging", 0x04: "full"}},
+
+    # 西伯利亚 XIBERIA T7：36F9，FF00，回复第 3 字节
+    {"name": "XIBERIA T7", "vid": 0x36F9, "pid": 0x0000,
+     "usage_page": 0xFF00, "frame": 64,
+     "request": [0x55, 0x65, 0x00] + [0x00] * 61,
+     "offset": 3, "any_pid": True},
+
+    # 雷柏 VT3S：24AE:1411，设备主动上报，只监听不写
+    {"name": "Rapoo VT3S", "vid": 0x24AE, "pid": 0x1411,
+     "usage_page": 0xFF00, "usage": 0x0002, "frame": 19,
+     "listen_only": True,
+     "offset": 8, "state_index": 7,
+     "states": {1: "discharging", 2: "charging", 3: "charging"}},
+
+    # MCHOSE 键盘 Z75S（SINOWEALTH 接收器）：20 字节，report 0x13，cmd 0x4A
+    {"name": "MCHOSE Z75S", "vid": 0x258A, "pid": 0x01BB,
+     "usage_page": 0xFF02, "frame": 20,
+     "request": None, "checksum": "sum0_18",
+     "offset": 5, "state_index": None},
+]
+
+
+def vendor_profiles_for(vid: int, pid: int) -> list:
+    """找出适配该设备的所有厂商协议。"""
+    out = []
+    for p in VENDOR_PROFILES:
+        if p["vid"] != vid:
+            continue
+        if not p.get("any_pid") and p["pid"] not in (0, pid):
+            continue
+        out.append(p)
+    return out
+
+
 def known_ids() -> set:
     """不再按 VID/PID 匹配内置设备；统一走标准 HID 或抓包协议。"""
     return set()
@@ -2205,6 +2294,96 @@ def requests_ok(reqs: list) -> bool:
     return bool(reqs)
 
 
+def _read_vendor_profile(ifaces: list, prof: dict):
+    """按厂商协议表读一次电量。
+
+    只做两件事：
+      1. 在 usage_page 匹配的集合上发请求帧
+      2. 从回复的 offset 处取百分比，state_index 处取充电状态
+    监听型协议（listen_only）只读不写。
+    """
+    want_off = int(prof.get("offset", 2))
+    frame_len = int(prof.get("frame", 64))
+    want_page = prof.get("usage_page")
+    want_usage = prof.get("usage")
+    listen_only = bool(prof.get("listen_only"))
+    request = prof.get("request")
+    states = prof.get("states") or {}
+
+    cand = []
+    for d in ifaces:
+        if want_page is not None and d.usage_page != want_page:
+            continue
+        if want_usage is not None and getattr(d, "usage", 0) != want_usage:
+            continue
+        if d.input_len < frame_len:
+            continue
+        if not listen_only and d.output_len < frame_len:
+            continue
+        cand.append(d)
+    if not cand:
+        return None
+
+    req = None
+    if request:
+        req = bytes(request)
+        if len(req) < frame_len:
+            req = req + bytes(frame_len - len(req))
+    elif prof.get("checksum") == "sum0_18":
+        # MCHOSE 键盘：20 字节，report 0x13，cmd 0x4A，末字节是前 19 字节和
+        body = [0x13, 0x4A, 0x01, 0x00] + [0x00] * 15
+        body = body[:frame_len - 1]
+        ck = sum(body) & 0xFF
+        req = bytes(body + [ck])
+
+    for d in cand:
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=not listen_only)
+            if req is not None and not listen_only:
+                try:
+                    dev.drain()
+                except Exception:
+                    pass
+                if prof.get("set_report"):
+                    try:
+                        dev.set_feature(req)
+                    except Exception:
+                        dev.write_output(req)
+                else:
+                    dev.write_output(req)
+
+            deadline = time.monotonic() + (
+                5.0 if listen_only else 1.2)
+            while time.monotonic() < deadline:
+                rep = dev.read_input(max(frame_len, d.input_len), 300)
+                if not rep or len(rep) <= want_off:
+                    continue
+                val = rep[want_off]
+                if not (0 <= val <= 100):
+                    continue
+
+                r = Reading(ok=True, level=val, source="厂商协议",
+                            detail=prof.get("name", ""), raw=rep)
+                si = prof.get("state_index")
+                if si is not None and len(rep) > si:
+                    st = states.get(rep[si])
+                    if st:
+                        r.status = st
+                if r.status == "full":
+                    r.level = 100
+                return r
+        except Exception:
+            pass
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+    return None
+
+
 def _read_user_protocol(ifaces: list, proto: dict):
     """用抓包得到的通用协议读一次电量（逐个尝试候求帧）?"""
     off = int(proto.get("offset", 2))
@@ -2853,6 +3032,209 @@ def apply_acrylic(hwnd: int, light: bool) -> bool:
         return bool(user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data)))
     except Exception:
         return False
+
+
+# ===========================================================================
+# 分层窗口合成器
+#
+# Tk 的 Canvas 没有抗锯齿，SetWindowRgn 又是二值裁剪，圆角必然是阶梯状。
+# 这里把「窗口外观」接管过来：
+#   1. 用 PrintWindow 把 Tk 画的内容抓成 32bpp DIB
+#   2. 逐像素按 SDF 覆盖率算圆角 alpha（边缘 1px 线性羽化）
+#   3. 用 UpdateLayeredWindow 一次贴上去
+#
+# Tk 窗口本身变成完全透明的宿主，只负责画内容和收鼠标事件。
+# ===========================================================================
+# region 边缘羽化宽度（设备像素）
+_LAYER_EDGE = 1.0
+
+
+def _sdf_round_rect(px: float, py: float, w: float, h: float,
+                    r: float) -> float:
+    """圆角矩形有符号距离：内部为负，外部为正。"""
+    cx, cy = w * 0.5, h * 0.5
+    qx = abs(px - cx) - (cx - r)
+    qy = abs(py - cy) - (cy - r)
+    dx = qx if qx > 0.0 else 0.0
+    dy = qy if qy > 0.0 else 0.0
+    outside = (dx * dx + dy * dy) ** 0.5
+    inside = qx if qx > qy else qy
+    if outside > 0.0:
+        return outside - r
+    if inside < 0.0:
+        return inside - r
+    return -r
+
+
+class LayeredPanel:
+    """把 Tk 窗口的真实内容做圆角抗锯齿后重新贴上去。
+
+    Tk 侧的 root 需要：
+      - overrideredirect(True)
+      - 窗口属性 WS_EX_LAYERED（下面 _prepare 里加）
+    这个类不接管事件，只负责「显示层」。
+    """
+
+    def __init__(self, panel):
+        self.panel = panel
+        self.hwnd = 0
+        self._dib = None          # (w, h, memdc, hbm, bits_ptr)
+        self._dib2 = None
+        self._w = 0
+        self._h = 0
+        self._enabled = False
+
+    # -- 生命周期 -----------------------------------------------------
+    def prepare(self, hwnd: int, w: int, h: int) -> bool:
+        """给窗口加 WS_EX_LAYERED，并准备两块 DIB。"""
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            style = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                                     style | WS_EX_LAYERED)
+            self.hwnd = hwnd
+            self._w, self._h = int(w), int(h)
+            self._enabled = True
+            self._alloc()
+            return True
+        except Exception:
+            self._enabled = False
+            return False
+
+    def _alloc(self):
+        w, h, s = self._w, self._h, self.panel.S
+        self._free()
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+
+        # 抓取用：和屏幕兼容
+        dc1 = gdi32.CreateCompatibleDC(None)
+        bits1 = ctypes.c_void_p()
+        bmp1 = gdi32.CreateDIBSection(dc1, ctypes.byref(bmi), 0,
+                                      ctypes.byref(bits1), None, 0)
+        gdi32.SelectObject(dc1, bmp1)
+
+        # 合成用：再开一块，避免原地改
+        dc2 = gdi32.CreateCompatibleDC(None)
+        bits2 = ctypes.c_void_p()
+        bmp2 = gdi32.CreateDIBSection(dc2, ctypes.byref(bmi), 0,
+                                      ctypes.byref(bits2), None, 0)
+        gdi32.SelectObject(dc2, bmp2)
+
+        self._dib = (w, h, dc1, bmp1, bits1)
+        self._dib2 = (w, h, dc2, bmp2, bits2)
+
+    def _free(self):
+        for slot in (self._dib, self._dib2):
+            if not slot:
+                continue
+            _w, _h, dc, bmp, _bits = slot
+            try:
+                gdi32.DeleteObject(bmp)
+            except Exception:
+                pass
+            try:
+                gdi32.DeleteDC(dc)
+            except Exception:
+                pass
+        self._dib = None
+        self._dib2 = None
+
+    def destroy(self):
+        self._free()
+        self._enabled = False
+        self.hwnd = 0
+
+    # -- 合成 ---------------------------------------------------------
+    def composite(self):
+        """抓 Tk 内容 → 圆角 alpha → UpdateLayeredWindow。"""
+        if not self._enabled or not self.hwnd or not self._dib:
+            return
+        try:
+            if not user32.IsWindowVisible(self.hwnd):
+                return
+        except Exception:
+            return
+        try:
+            pos = user32.GetWindowRect
+        except Exception:
+            pos = None
+        _ = pos
+
+        src_w, src_h, src_dc, _src_bmp, src_bits = self._dib
+        dst_w, dst_h, dst_dc, _dst_bmp, dst_bits = self._dib2
+
+        # 用 PrintWindow 抓纯客户区（PW_CLIENTONLY = 1）
+        ok = False
+        try:
+            user32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+            user32.PrintWindow.restype = wt.BOOL
+            ok = bool(user32.PrintWindow(self.hwnd, src_dc, 1))
+        except Exception:
+            ok = False
+        if not ok:
+            # 退化：抓不到就让窗口正常显示，不改外观
+            return
+
+        radius = float(self.panel._radius_px())
+        n = int(src_w * src_h)
+        src = ctypes.string_at(src_bits, n * 4)
+        buf = bytearray(src)
+        w, h = src_w, src_h
+
+        # 先算圆角 alpha，再乘到原像素上（预乘）
+        for y in range(h):
+            py = y + 0.5
+            for x in range(w):
+                px_ = x + 0.5
+                d = _sdf_round_rect(px_, py, float(w), float(h), radius)
+                if d <= -0.5:
+                    continue                     # 完全在内部，保持原样
+                if d >= 0.5:
+                    i = (y * w + x) * 4
+                    buf[i] = buf[i + 1] = buf[i + 2] = buf[i + 3] = 0
+                    continue
+                cov = 0.5 - d                    # 0..1
+                i = (y * w + x) * 4
+                a = buf[i + 3]
+                na = int(a * cov + 0.5)
+                if na <= 0:
+                    buf[i] = buf[i + 1] = buf[i + 2] = buf[i + 3] = 0
+                    continue
+                # 预乘：BGRA 各通道乘 alpha
+                b_, g_, r_ = buf[i], buf[i + 1], buf[i + 2]
+                buf[i] = min(255, int(b_ * cov + 0.5))
+                buf[i + 1] = min(255, int(g_ * cov + 0.5))
+                buf[i + 2] = min(255, int(r_ * cov + 0.5))
+                buf[i + 3] = na
+
+        ctypes.memmove(dst_bits, bytes(buf), len(buf))
+
+        try:
+            origin = user32.GetWindowRect
+            _ = origin
+        except Exception:
+            pass
+        rect = wt.RECT()
+        user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
+        pt_dst = wt.POINT(rect.left, rect.top)
+        size = wt.SIZE(w, h)
+        pt_src = wt.POINT(0, 0)
+        blend = BLENDFUNCTION(0, 0, 255, 1)
+        try:
+            user32.UpdateLayeredWindow(self.hwnd, None,
+                                       ctypes.byref(pt_dst),
+                                       ctypes.byref(size), dst_dc,
+                                       ctypes.byref(pt_src), 0,
+                                       ctypes.byref(blend), 2)
+        except Exception:
+            pass
 
 
 def set_round_region(hwnd: int, w: int, h: int, radius: int = 24) -> None:
@@ -3575,6 +3957,12 @@ class HelpWindow:
             pass
         self.shadow = None
         try:
+            if getattr(self, "_layered", None):
+                self._layered.destroy()
+                self._layered = None
+        except Exception:
+            pass
+        try:
             self.root.destroy()
         except Exception:
             pass
@@ -3833,8 +4221,11 @@ class Panel:
         self.root.update_idletasks()
         hwnd = self.root.winfo_id()
         self.hwnd = hwnd
-        # 圆半径 16px（Region 的椭圆直径是半径的两倍）
+        # 圆角裁剪：SetWindowRgn 是二值裁剪，没有抗锯齿。
+        # 分层窗口方案（LayeredPanel）在本机实测会破坏 Tk 绘制，
+        # 已停用，保留类定义供以后试验。
         set_round_region(hwnd, self.W, self.H, int(32 * self.S))
+        self._layered = None
         try:
             GCL_STYLE = -26
             style = user32.GetClassLongPtrW(hwnd, GCL_STYLE)
@@ -3855,6 +4246,20 @@ class Panel:
             self._shadow = None
         self._center()
         self.root.withdraw()
+
+    def _radius_px(self) -> float:
+        """当前窗口圆角半径（设备像素）。"""
+        return 16.0 * self.S
+
+    def _composite(self):
+        """把 Tk 画好的内容做圆角抗锯齿后贴到分层窗口。"""
+        lp = getattr(self, "_layered", None)
+        if lp is None:
+            return
+        try:
+            lp.composite()
+        except Exception:
+            pass
 
     def _center(self):
         sw = self.root.winfo_screenwidth()
@@ -4309,6 +4714,7 @@ class Panel:
                     lambda: self._toggle_startup())
         self._button(472, 360, 64, 24, "最小化", self.hide, kind="ghost")
         cv.scale("all", 0, 0, self.S, self.S)
+        self._composite()
 
     def _draw_border(self):
         """整圈 2px 边框：一条闭合折线 + 圆角连接，避免直线/圆弧接头。"""
